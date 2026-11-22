@@ -1,0 +1,88 @@
+name: Personal Android Build
+
+# يُشغَّل يدوياً فقط: من تبويب Actions ثم Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # نفس إصدار Flutter الذي يحدده المشروع نفسه
+      - name: Read Flutter version
+        id: flutter_version
+        run: |
+          VERSION=$(tr -d '[:space:]' < .github/flutter-version)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          cache: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+          cache: gradle
+
+      - name: Get dependencies
+        run: |
+          flutter --version
+          flutter pub get
+
+      # توقيع التطبيق: إن وُجدت أسرار KEYSTORE_* تُستعمل (تحديثات تُثبَّت فوق النسخة القديمة)،
+      # وإلا يُنشأ مفتاح مؤقت لهذه النسخة فقط.
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using the keystore from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore.jks
+            STORE_PASS="$KEYSTORE_PASSWORD"
+            KEY_PASS="$KEY_PASSWORD"
+            ALIAS="$KEY_ALIAS"
+          else
+            echo "No keystore secret found: generating a temporary key"
+            STORE_PASS="temporarypass"
+            KEY_PASS="temporarypass"
+            ALIAS="personal"
+            keytool -genkeypair -keystore android/app/keystore.jks \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=Personal Anx Reader"
+          fi
+          {
+            echo "storePassword=${STORE_PASS}"
+            echo "keyPassword=${KEY_PASS}"
+            echo "keyAlias=${ALIAS}"
+            echo "storeFile=keystore.jks"
+          } > android/key.properties
+
+      - name: Generate code
+        run: |
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      # نبني نسخة arm64 فقط (تناسب هواتف أندرويد الحديثة) لتوفير الوقت
+      - name: Build APK
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: anx-reader-personal-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
