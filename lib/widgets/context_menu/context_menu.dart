@@ -6,7 +6,7 @@ import 'package:anx_reader/widgets/common/axis_flex.dart';
 import 'package:anx_reader/widgets/context_menu/excerpt_menu.dart';
 import 'package:anx_reader/widgets/context_menu/reader_note_menu.dart';
 import 'package:anx_reader/widgets/context_menu/search_menu.dart';
-import 'package:anx_reader/widgets/context_menu/translation_menu.dart';
+import 'package:anx_reader/widgets/context_menu/reading_assist_menu.dart';
 import 'package:flutter/material.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 
@@ -566,7 +566,7 @@ class _ContextMenuOverlayState extends State<_ContextMenuOverlay>
                           AxisFlex(
                             axis: widget.axis,
                             children: [
-                              TranslationMenu(
+                              ReadingAssistMenu(
                                 content: widget.annoContent,
                                 decoration: widget.decoration,
                                 axis: widget.axis,
