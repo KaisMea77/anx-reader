@@ -6,8 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 import 'dart:async';
 
-class reading_assist_menu.dart extends StatefulWidget {
-  const ReadingAssistMenu({
+class TranslationMenu extends StatefulWidget {
+  const TranslationMenu({
     super.key,
     required this.content,
     required this.decoration,
@@ -20,10 +20,10 @@ class reading_assist_menu.dart extends StatefulWidget {
   final String? contextText;
 
   @override
-  State<ReadingAssistMenu> createState() => _ReadingAssistMenuState();
+  State<TranslationMenu> createState() => _TranslationMenuState();
 }
 
-class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
+class _TranslationMenuState extends State<TranslationMenu> {
   Widget? _translationWidget;
   Timer? _debounceTimer;
   bool _translationInitialized = false;
@@ -114,7 +114,7 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
 
   @override
   Widget build(BuildContext context) {
-    // print('Building ReadingAssistMenu');
+    // print('Building TranslationMenu');
     return Expanded(
       child: AnimatedSize(
         duration: const Duration(milliseconds: 300),
