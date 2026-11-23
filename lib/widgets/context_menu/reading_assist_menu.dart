@@ -1,327 +1,487 @@
-// Reading assistant core: spoiler-safe context extraction + prompt builders.
-//
-// Pure Dart (no Flutter imports) so it can be unit-tested on its own.
-//
-// How the "knows the book only up to your page" guarantee works:
-//  * The JavaScript below runs inside the reader WebView and returns ONLY text
-//    that comes before the end of the page currently on screen: earlier
-//    chapters, plus the current chapter up to the last visible line.
-//  * If the position cannot be determined, it returns an error instead of
-//    guessing, and nothing is sent to the AI.
-//  * The book title and author are never added to the prompt.
-import 'dart:convert';
+// FILE PATH: lib/widgets/context_menu/reading_assist_menu.dart  (menu/UI file)
+import 'dart:async';
 
-class ReadingAssistSnippet {
-  const ReadingAssistSnippet({required this.part, required this.text});
+import 'package:anx_reader/config/shared_preference_provider.dart';
+import 'package:anx_reader/enums/ai_prompts.dart';
+import 'package:anx_reader/enums/lang_list.dart';
+import 'package:anx_reader/page/reading_page.dart';
+import 'package:anx_reader/service/ai/prompt_generate.dart';
+import 'package:anx_reader/service/ai/reading_assist.dart';
+import 'package:anx_reader/service/translate/index.dart';
+import 'package:anx_reader/widgets/ai/ai_stream.dart';
+import 'package:anx_reader/widgets/context_menu/translation_menu.dart';
+import 'package:flutter/material.dart';
+import 'package:langchain_core/prompts.dart'
+    show ChatPromptTemplate, HumanChatMessagePromptTemplate;
+import 'package:pointer_interceptor/pointer_interceptor.dart';
 
-  /// Zero-based index of the book section (chapter file) the snippet is from.
-  final int part;
-  final String text;
-}
-
-class ReadingAssistContext {
-  const ReadingAssistContext({
-    required this.ok,
-    this.reason = '',
-    this.recent = '',
-    this.snippets = const [],
-    this.mentions = 0,
-    this.skipped = 0,
-    this.partsScanned = 0,
+/// A card shown under the selection toolbar with three tabs:
+///  * Translate: translation in context (uses the translation engine you chose)
+///  * Explain:   explains the hard passage, knowing the book only up to your page
+///  * Who is it: reminds you who a character / what a term is, from what you read
+///
+/// The AI tabs are loaded lazily (only when tapped) so nothing is sent to an AI
+/// provider unless you ask for it.
+class ReadingAssistMenu extends StatefulWidget {
+  const ReadingAssistMenu({
+    super.key,
+    required this.content,
+    required this.decoration,
+    required this.axis,
+    this.contextText,
   });
 
-  const ReadingAssistContext.failed(String reason)
-    : this(ok: false, reason: reason);
+  final String content;
+  final BoxDecoration decoration;
+  final Axis axis;
+  final String? contextText;
 
-  final bool ok;
-  final String reason;
-
-  /// Text read just before (and including) the end of the current page.
-  final String recent;
-
-  /// Earlier passages mentioning the selected word (reading order).
-  final List<ReadingAssistSnippet> snippets;
-  final int mentions;
-  final int skipped;
-  final int partsScanned;
+  @override
+  State<ReadingAssistMenu> createState() => _ReadingAssistMenuState();
 }
 
-/// Builds the JavaScript function body passed to `callAsyncJavaScript`.
-String buildContextScript({
-  required String query,
-  required bool scan,
-  int recentChars = 2500,
-}) {
-  final config = jsonEncode({
-    'query': query,
-    'scan': scan,
-    'recentChars': recentChars,
-    'window': 220,
-    'first': 3,
-    'last': 5,
-  }).replaceAll('\u2028', r'\u2028').replaceAll('\u2029', r'\u2029');
-  return _contextScript.replaceAll('__CONFIG__', config);
-}
+class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
+  int _tab = 0;
+  final Set<int> _opened = <int>{0};
+  int _version = 0;
 
-ReadingAssistContext parseContextResult(Object? raw) {
-  if (raw is! String || raw.isEmpty) {
-    return const ReadingAssistContext.failed('no-result');
-  }
-  try {
-    final map = jsonDecode(raw);
-    if (map is! Map) return const ReadingAssistContext.failed('bad-result');
-    if (map['ok'] != true) {
-      return ReadingAssistContext.failed('${map['reason'] ?? 'unknown'}');
+  Widget? _translationWidget;
+  Timer? _debounceTimer;
+  bool _translationInitialized = false;
+
+  Future<ReadingAssistContext>? _explainContext;
+  Future<ReadingAssistContext>? _whoContext;
+
+  @override
+  void initState() {
+    super.initState();
+    // First use: make Arabic the default target for translation and answers
+    // (otherwise the app follows its interface language). Later choices made
+    // with the language picker are kept.
+    if (Prefs().prefs.getString('translateTo') == null) {
+      unawaited(
+        Prefs().prefs.setString('translateTo', LangListEnum.arabic.code),
+      );
     }
-    final snippets = <ReadingAssistSnippet>[];
-    final rawSnippets = map['snippets'];
-    if (rawSnippets is List) {
-      for (final s in rawSnippets) {
-        if (s is Map) {
-          snippets.add(
-            ReadingAssistSnippet(
-              part: (s['part'] as num?)?.toInt() ?? 0,
-              text: '${s['text'] ?? ''}',
+    if (widget.axis == Axis.horizontal) {
+      _initializeTranslation();
+    }
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    super.dispose();
+  }
+
+  String? get _effectiveContext =>
+      (widget.contextText?.trim().isEmpty ?? true) ? null : widget.contextText;
+
+  bool get _arabic =>
+      Localizations.localeOf(context).languageCode == 'ar' ||
+      Prefs().translateTo == LangListEnum.arabic;
+
+  String _t(String ar, String en) => _arabic ? ar : en;
+
+  TextDirection get _answerDirection =>
+      Prefs().translateTo == LangListEnum.arabic
+      ? TextDirection.rtl
+      : TextDirection.ltr;
+
+  // ---------------------------------------------------------------------------
+  // Translation tab (same behaviour as the original translation card)
+  // ---------------------------------------------------------------------------
+
+  void _initializeTranslation() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _translationInitialized) return;
+      _debounceTimer?.cancel();
+      _debounceTimer = Timer(const Duration(milliseconds: 300), () {
+        if (!mounted || _translationInitialized) return;
+        setState(() {
+          _translationWidget = translateText(
+            widget.content,
+            service: TranslateService.ai,
+            contextText: _effectiveContext,
+          );
+          _translationInitialized = true;
+        });
+      });
+    });
+  }
+
+  void _onLanguageChanged() {
+    _debounceTimer?.cancel();
+    setState(() {
+      _version++;
+      _tab = 0;
+      _opened
+        ..clear()
+        ..add(0);
+      _explainContext = null;
+      _whoContext = null;
+      _translationWidget = translateText(
+        widget.content,
+        service: TranslateService.ai,
+        contextText: _effectiveContext,
+      );
+      _translationInitialized = true;
+    });
+  }
+
+  Widget _langPicker(bool isFrom) {
+    final MenuController menuController = MenuController();
+
+    return PointerInterceptor(
+      child: MenuAnchor(
+        style: MenuStyle(
+          backgroundColor: WidgetStateProperty.all(
+            Theme.of(context).colorScheme.secondaryContainer,
+          ),
+          maximumSize: WidgetStateProperty.all(const Size(300, 300)),
+        ),
+        controller: menuController,
+        menuChildren: [
+          for (var lang in LangListEnum.values)
+            PointerInterceptor(
+              child: MenuItemButton(
+                onPressed: () {
+                  if (isFrom) {
+                    Prefs().translateFrom = lang;
+                  } else {
+                    Prefs().translateTo = lang;
+                  }
+                  _onLanguageChanged();
+                },
+                child: Text(lang.getNative(context)),
+              ),
+            ),
+        ],
+        builder: (context, controller, child) {
+          return GestureDetector(
+            onTap: () {
+              if (controller.isOpen) {
+                controller.close();
+              } else {
+                controller.open();
+              }
+            },
+            child: Text(
+              isFrom
+                  ? Prefs().translateFrom.getNative(context)
+                  : Prefs().translateTo.getNative(context),
             ),
           );
-        }
+        },
+      ),
+    );
+  }
+
+  Widget _languageRow() {
+    return Row(
+      children: [
+        _langPicker(true),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 6),
+          child: Icon(Icons.arrow_forward_ios, size: 14),
+        ),
+        _langPicker(false),
+      ],
+    );
+  }
+
+  Widget _translateBody() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          widget.content,
+          maxLines: 4,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 16),
+        ),
+        const SizedBox(height: 8),
+        Directionality(
+          textDirection: _answerDirection,
+          child: KeyedSubtree(
+            key: ValueKey('translation-$_version'),
+            child:
+                _translationWidget ??
+                const SizedBox(height: 20, child: Center(child: Text('...'))),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // AI tabs (Explain / Who is it)
+  // ---------------------------------------------------------------------------
+
+  /// Reads the book text from the reader WebView, strictly up to the end of
+  /// the page on screen. On any problem it fails instead of guessing.
+  Future<ReadingAssistContext> _loadContext({required bool scan}) async {
+    try {
+      final controller = epubPlayerKey.currentState?.webViewController;
+      if (controller == null) {
+        return const ReadingAssistContext.failed('no-reader');
       }
-    }
-    return ReadingAssistContext(
-      ok: true,
-      recent: '${map['recent'] ?? ''}',
-      snippets: snippets,
-      mentions: (map['mentions'] as num?)?.toInt() ?? 0,
-      skipped: (map['skipped'] as num?)?.toInt() ?? 0,
-      partsScanned: (map['partsScanned'] as num?)?.toInt() ?? 0,
-    );
-  } catch (e) {
-    return ReadingAssistContext.failed('parse-error');
-  }
-}
-
-String _clip(String text, int max) {
-  final t = text.trim();
-  return t.length <= max ? t : '${t.substring(0, max)}…';
-}
-
-const String _rules = '''
-You are a spoiler-safe reading companion inside an e-book reader.
-The reader is part-way through a book. The excerpts below are text the reader has ALREADY read. Nothing after their current page is provided, and you are deliberately not told the book's title or author.
-
-Rules:
-1. Base every statement about the story (plot, characters, places, relationships) ONLY on the provided excerpts. Do not use any memory you may have of this book, its sequels or adaptations, and never hint at what might happen later.
-2. You may use general knowledge about language, idioms, history, culture and literary allusions to explain meaning.
-3. If the excerpts do not contain enough information, say so briefly instead of guessing.
-4. Write the answer in {LANG}. Be concise and use plain words. No preamble and no closing remarks.
-5. If the book is in a different language from {LANG}, keep character and place names recognisable: write them in {LANG} and give the original spelling in parentheses the first time.''';
-
-String buildExplainPrompt({
-  required String language,
-  required String selected,
-  String? contextSentence,
-  required String recent,
-}) {
-  final b = StringBuffer(_rules.replaceAll('{LANG}', language));
-  b.writeln('\n');
-  b.writeln(
-    'Task: The reader selected the passage below and finds it hard to '
-    'understand. Explain what it means in this context, in simple words '
-    '(3-6 short sentences). If it contains an idiom, old-fashioned or '
-    'figurative wording, or an allusion, name it and say what it means.',
-  );
-  b.writeln('\nSelected passage:\n<<<\n${_clip(selected, 1500)}\n>>>');
-  final sentence = contextSentence?.trim() ?? '';
-  if (sentence.isNotEmpty) {
-    b.writeln('\nSurrounding sentence:\n<<<\n${_clip(sentence, 700)}\n>>>');
-  }
-  final r = recent.trim();
-  if (r.isNotEmpty) {
-    b.writeln(
-      '\nText the reader has just read, up to the end of their current '
-      'page (most recent last):\n<<<\n$r\n>>>',
-    );
-  }
-  return b.toString();
-}
-
-String buildWhoPrompt({
-  required String language,
-  required String selected,
-  required ReadingAssistContext context,
-}) {
-  final label = _clip(selected, 80);
-  final b = StringBuffer(_rules.replaceAll('{LANG}', language));
-  b.writeln('\n');
-  b.writeln(
-    'Task: The reader selected "$label" and wants a reminder of who or '
-    'what it is. Using ONLY the excerpts below, answer with:\n'
-    '- **Who / what**: one or two sentences.\n'
-    '- **Connections**: how it relates to other characters or places '
-    'mentioned.\n'
-    '- **So far**: up to 4 short bullets of what has happened to or around '
-    'it, in reading order.\n'
-    'If "$label" does not look like a character, place or story-specific '
-    'term, say that in one sentence and briefly explain the word instead.',
-  );
-  if (context.snippets.isEmpty) {
-    b.writeln(
-      '\nNo earlier mention of "$label" was found in the text read so '
-      'far.',
-    );
-  } else {
-    b.writeln(
-      '\nIt is mentioned ${context.mentions} time(s) in the text read '
-      'so far.'
-      '${context.skipped > 0 ? ' The earliest and the most recent mentions '
-                'are shown; ${context.skipped} in between are omitted.' : ''}',
-    );
-    b.writeln('\nExcerpts in reading order (Part = position in the book):');
-    for (final s in context.snippets) {
-      b.writeln('[Part ${s.part + 1}] ${s.text}');
+      final script = buildContextScript(
+        query: widget.content.trim(),
+        scan: scan,
+        recentChars: scan ? 1200 : 2500,
+      );
+      final result = await controller
+          .callAsyncJavaScript(functionBody: script)
+          .timeout(const Duration(seconds: 30));
+      return parseContextResult(result.value);
+    } catch (e) {
+      return const ReadingAssistContext.failed('error');
     }
   }
-  final r = context.recent.trim();
-  if (r.isNotEmpty) {
-    final tail = r.length > 1200 ? r.substring(r.length - 1200) : r;
-    b.writeln(
-      '\nText just before the reader\'s current position:\n<<<\n$tail\n>>>',
+
+  PromptTemplatePayload _payload(String prompt) {
+    final template = ChatPromptTemplate.fromPromptMessages([
+      HumanChatMessagePromptTemplate.fromTemplate('{assist_prompt}'),
+    ]);
+    return PromptTemplatePayload(
+      template: template,
+      variables: {'assist_prompt': prompt},
+      identifier: AiPrompts.translate,
     );
   }
-  return b.toString();
+
+  Widget _hint(String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 13,
+          color: Theme.of(context).colorScheme.onSecondaryContainer
+              .withValues(alpha: 0.75),
+        ),
+      ),
+    );
+  }
+
+  String _failureMessage(String reason) {
+    return _t(
+      'تعذّر تحديد موضعك في الكتاب، فلم يُرسَل أي نص إلى الذكاء الاصطناعي '
+          'حتى لا تنكشف لك أحداث لم تقرأها. هذه الميزة تعمل مع الكتب النصية '
+          '(مثل EPUB)، وليس مع PDF.  [$reason]',
+      'Could not determine where you are in the book, so no text was sent to '
+          'the AI (to avoid spoilers). This works with text books such as '
+          'EPUB, not PDF.  [$reason]',
+    );
+  }
+
+  Widget _caption() {
+    final color = Theme.of(context).colorScheme.onSecondaryContainer
+        .withValues(alpha: 0.6);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          Icon(Icons.lock_outline, size: 12, color: color),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              _t(
+                'يعتمد على ما قرأتَه فقط، بلا حرق للأحداث',
+                'Uses only what you have read — no spoilers',
+              ),
+              style: TextStyle(fontSize: 11, color: color),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _aiBody({required bool who}) {
+    final future = who ? _whoContext : _explainContext;
+    return Directionality(
+      textDirection: _answerDirection,
+      child: FutureBuilder<ReadingAssistContext>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return _hint(
+              _t(
+                'أقرأ ما وصلتَ إليه من الكتاب…',
+                'Reading what you have read so far…',
+              ),
+            );
+          }
+          final ctx = snapshot.data;
+          if (ctx == null || !ctx.ok) {
+            return _hint(_failureMessage(ctx?.reason ?? 'unknown'));
+          }
+          final target = Prefs().translateTo;
+          final language = target == LangListEnum.auto
+              ? (_arabic ? 'العربية' : 'English')
+              : target.nativeName;
+          final prompt = who
+              ? buildWhoPrompt(
+                  language: language,
+                  selected: widget.content,
+                  context: ctx,
+                )
+              : buildExplainPrompt(
+                  language: language,
+                  selected: widget.content,
+                  contextSentence: _effectiveContext,
+                  recent: ctx.recent,
+                );
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _caption(),
+              AiStream(
+                key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
+                prompt: _payload(prompt),
+                regenerate: true,
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tabs
+  // ---------------------------------------------------------------------------
+
+  void _select(int index) {
+    if (index == _tab) return;
+    setState(() {
+      _tab = index;
+      _opened.add(index);
+      if (index == 1) {
+        _explainContext ??= _loadContext(scan: false);
+      } else if (index == 2) {
+        _whoContext ??= _loadContext(scan: true);
+      }
+    });
+  }
+
+  Widget _tabButton(int index, IconData icon, String label) {
+    final theme = Theme.of(context);
+    final selected = _tab == index;
+    final color = selected
+        ? theme.colorScheme.primary
+        : theme.colorScheme.onSecondaryContainer.withValues(alpha: 0.65);
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => _select(index),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: selected
+                    ? theme.colorScheme.primary
+                    : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 16, color: color),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    color: color,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bodyFor(int index) {
+    if (!_opened.contains(index)) return const SizedBox.shrink();
+    if (index == 0) return _translateBody();
+    return _aiBody(who: index == 2);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Vertical writing modes: keep the original translation card.
+    if (widget.axis == Axis.vertical) {
+      return TranslationMenu(
+        content: widget.content,
+        decoration: widget.decoration,
+        axis: widget.axis,
+        contextText: widget.contextText,
+      );
+    }
+
+    final screenHeight = MediaQuery.of(context).size.height;
+    final cardHeight = (screenHeight * 0.42).clamp(190.0, 320.0).toDouble();
+
+    return Expanded(
+      child: AnimatedSize(
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+        child: Material(
+          type: MaterialType.transparency,
+          child: Container(
+            height: cardHeight,
+            width: double.infinity,
+            decoration: widget.decoration,
+            padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    _tabButton(0, Icons.translate, _t('ترجمة', 'Translate')),
+                    _tabButton(
+                      1,
+                      Icons.lightbulb_outline,
+                      _t('شرح', 'Explain'),
+                    ),
+                    _tabButton(
+                      2,
+                      Icons.person_search_outlined,
+                      _t('من هذا؟', 'Who is it?'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Expanded(
+                  child: IndexedStack(
+                    index: _tab,
+                    sizing: StackFit.expand,
+                    children: [
+                      for (var i = 0; i < 3; i++)
+                        SingleChildScrollView(child: _bodyFor(i)),
+                    ],
+                  ),
+                ),
+                if (_tab == 0) ...[const Divider(height: 8), _languageRow()],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
-
-const String _contextScript = r'''
-const cfg = __CONFIG__;
-const fail = function (reason) {
-  return JSON.stringify({ ok: false, reason: reason });
-};
-try {
-  const view = reader && reader.view;
-  const loc = view && view.lastLocation;
-  if (!view || !loc || !loc.range) return fail('no-location');
-
-  const idx = reader.index;
-  const contents = view.renderer.getContents();
-  const cur =
-    contents.find(function (c) {
-      return c.index === idx;
-    }) || contents[0];
-  if (!cur || !cur.doc || !cur.doc.body) return fail('no-document');
-  const doc = cur.doc;
-
-  // The visible page range. If it does not belong to the document we are
-  // reading from, stop: never guess a position (this is the spoiler guard).
-  const vr = loc.range;
-  if (!vr.endContainer || vr.endContainer.ownerDocument !== doc) {
-    return fail('range-mismatch');
-  }
-
-  const norm = function (s) {
-    return String(s || '').replace(/\s+/g, ' ').trim();
-  };
-
-  // Text of the current chapter from its start to the END OF THE VISIBLE PAGE.
-  const upTo = doc.createRange();
-  upTo.setStart(doc.body, 0);
-  upTo.setEnd(vr.endContainer, vr.endOffset);
-  const currentText = norm(upTo.toString());
-
-  const out = {
-    ok: true,
-    recent: currentText.slice(-cfg.recentChars),
-    snippets: [],
-    mentions: 0,
-    skipped: 0,
-    partsScanned: 1,
-  };
-  if (!cfg.scan) return JSON.stringify(out);
-
-  const esc = function (s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  };
-
-  // Search terms: the whole selection, plus capitalised words (names) or
-  // words of caseless scripts when several words were selected.
-  const raw = norm(cfg.query);
-  const terms = [];
-  if (raw && raw.length <= 80) terms.push(raw);
-  raw.split(/[\s,.;:!?()\[\]"\u201c\u201d\u00ab\u00bb'\u2019\-\u2013\u2014]+/).forEach(function (w) {
-    if (w.length < 3 || terms.indexOf(w) !== -1) return;
-    const isNameLike = w[0] !== w[0].toLowerCase();
-    const isCaseless = w === w.toLowerCase() && w === w.toUpperCase();
-    if (isNameLike || isCaseless || raw === w) terms.push(w);
-  });
-  if (!terms.length) return JSON.stringify(out);
-  terms.sort(function (a, b) {
-    return b.length - a.length;
-  });
-  const re = new RegExp(terms.map(esc).join('|'), 'giu');
-
-  // Text of earlier chapters only (index < current), cached per book.
-  const sections = (view.book && view.book.sections) || [];
-  const cache = reader.__anxAssistCache || (reader.__anxAssistCache = new Map());
-  const sectionText = async function (i) {
-    if (cache.has(i)) return cache.get(i);
-    const s = sections[i];
-    let t = '';
-    if (s && s.linear !== 'no' && typeof s.createDocument === 'function') {
-      try {
-        const d = await s.createDocument();
-        t = norm(d && d.body && d.body.textContent);
-      } catch (e) {
-        t = '';
-      }
-    }
-    cache.set(i, t);
-    return t;
-  };
-
-  const parts = [];
-  for (let i = 0; i < idx; i++) {
-    const t = await sectionText(i);
-    if (t) parts.push({ part: i, text: t });
-  }
-  parts.push({ part: idx, text: currentText });
-  out.partsScanned = parts.length;
-
-  const W = cfg.window;
-  const hits = [];
-  for (let k = 0; k < parts.length; k++) {
-    const p = parts[k];
-    re.lastIndex = 0;
-    let m;
-    let lastEnd = -1;
-    while ((m = re.exec(p.text)) !== null) {
-      if (m[0].length === 0) {
-        re.lastIndex++;
-        continue;
-      }
-      out.mentions++;
-      if (m.index >= lastEnd) {
-        const s = Math.max(0, m.index - W);
-        const e = Math.min(p.text.length, m.index + m[0].length + W);
-        hits.push({
-          part: p.part,
-          text:
-            (s > 0 ? '\u2026' : '') +
-            p.text.slice(s, e) +
-            (e < p.text.length ? '\u2026' : ''),
-        });
-        lastEnd = e;
-      }
-      if (out.mentions >= 5000) break;
-    }
-    if (out.mentions >= 5000) break;
-  }
-
-  let chosen = hits;
-  if (hits.length > cfg.first + cfg.last) {
-    chosen = hits.slice(0, cfg.first).concat(hits.slice(hits.length - cfg.last));
-    out.skipped = hits.length - chosen.length;
-  }
-  out.snippets = chosen;
-  return JSON.stringify(out);
-} catch (e) {
-  return fail('error:' + String(e && e.message ? e.message : e));
-}''';
