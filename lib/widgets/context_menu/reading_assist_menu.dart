@@ -16,12 +16,14 @@ import 'package:langchain_core/prompts.dart'
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 
 /// A card shown under the selection toolbar with three tabs:
-///  * Translate: translation in context (uses the translation engine you chose)
+///  * Translate: AI translation in context (selection / sentence / paragraph)
 ///  * Explain:   explains the hard passage, knowing the book only up to your page
-///  * Who is it: reminds you who a character / what a term is, from what you read
+///  * Who is it: reminds you who a character is / what a place or term is
 ///
-/// The AI tabs are loaded lazily (only when tapped) so nothing is sent to an AI
-/// provider unless you ask for it.
+/// The card opens on the most useful tab by itself: a name (character, place,
+/// people) opens "Who is it?", anything else opens "Translate".
+/// The AI tabs are loaded lazily so nothing is sent to an AI provider unless
+/// the tab is shown.
 class ReadingAssistMenu extends StatefulWidget {
   const ReadingAssistMenu({
     super.key,
@@ -41,9 +43,23 @@ class ReadingAssistMenu extends StatefulWidget {
 }
 
 class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
-  int _tab = 0;
-  final Set<int> _opened = <int>{0};
+  late int _tab;
+  final Set<int> _opened = <int>{};
+
+  /// Changes with the language: re-creates the AI tabs.
   int _version = 0;
+
+  /// Changes every time the translation is rebuilt.
+  int _translationVersion = 0;
+
+  /// Becomes true as soon as the reader touches the card, so the automatic
+  /// tab choice never overrides a manual one.
+  bool _userInteracted = false;
+
+  /// What the translation covers: 0 = selection, 1 = sentence, 2 = paragraph.
+  int _scope = 0;
+  Future<ReadingAssistBlocks>? _blocksFuture;
+  ReadingAssistBlocks? _blocks;
 
   Widget? _translationWidget;
   Timer? _debounceTimer;
@@ -63,8 +79,26 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         Prefs().prefs.setString('translateTo', LangListEnum.arabic.code),
       );
     }
+
+    _tab = 0;
     if (widget.axis == Axis.horizontal) {
-      _initializeTranslation();
+      final guess = guessInitialTab(
+        selected: widget.content,
+        contextText: _effectiveContext,
+        answerIsArabic: Prefs().translateTo == LangListEnum.arabic,
+      );
+      _tab = guess.tab;
+      _opened.add(_tab);
+      if (_tab == 0) {
+        _startTranslation();
+      } else {
+        _prepareAiTab(_tab);
+      }
+      if (guess.needsNameCheck) {
+        unawaited(_runNameCheck());
+      }
+    } else {
+      _opened.add(0);
     }
   }
 
@@ -88,30 +122,126 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       ? TextDirection.rtl
       : TextDirection.ltr;
 
+  static bool _looksRtl(String text) =>
+      RegExp(r'[\u0590-\u08FF]').hasMatch(text);
+
   // ---------------------------------------------------------------------------
-  // Translation tab (same behaviour as the original translation card)
+  // Talking to the reader page
   // ---------------------------------------------------------------------------
 
-  void _initializeTranslation() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _translationInitialized) return;
-      _debounceTimer?.cancel();
-      _debounceTimer = Timer(const Duration(milliseconds: 300), () {
-        if (!mounted || _translationInitialized) return;
-        setState(() {
-          _translationWidget = translateText(
-            widget.content,
-            service: TranslateService.ai,
-            contextText: _effectiveContext,
-          );
-          _translationInitialized = true;
-        });
-      });
+  Future<Object?> _runScript(
+    String script, {
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    try {
+      final controller = epubPlayerKey.currentState?.webViewController;
+      if (controller == null) return null;
+      final result = await controller
+          .callAsyncJavaScript(functionBody: script)
+          .timeout(timeout);
+      return result.value;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Is the selection a name? Looks at the text read so far in this chapter.
+  Future<void> _runNameCheck() async {
+    final raw = await _runScript(
+      buildContextScript(
+        query: widget.content.trim(),
+        scan: false,
+        nameCheck: true,
+        recentChars: 100,
+      ),
+      timeout: const Duration(seconds: 8),
+    );
+    final check = parseNameCheckResult(raw);
+    if (!mounted || _userInteracted || !check.looksLikeName) return;
+    _debounceTimer?.cancel();
+    _select(2, manual: false);
+  }
+
+  /// Reads the book text from the reader WebView, strictly up to the end of
+  /// the page on screen. On any problem it fails instead of guessing.
+  Future<ReadingAssistContext> _loadContext({required bool scan}) async {
+    final raw = await _runScript(
+      buildContextScript(
+        query: widget.content.trim(),
+        scan: scan,
+        recentChars: scan ? 1200 : 2500,
+      ),
+    );
+    if (raw == null) return const ReadingAssistContext.failed('error');
+    return parseContextResult(raw);
+  }
+
+  Future<ReadingAssistBlocks> _loadBlocks() async {
+    final raw = await _runScript(
+      buildBlocksScript(),
+      timeout: const Duration(seconds: 10),
+    );
+    return parseBlocksResult(raw);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Translation tab
+  // ---------------------------------------------------------------------------
+
+  /// The text the translation currently covers.
+  String _sourceText() {
+    if (_scope == 0) return widget.content;
+    final blocks = _blocks;
+    if (blocks != null && blocks.ok) {
+      final text = _scope == 1 ? blocks.sentence : blocks.paragraph;
+      if (text.isNotEmpty) return text;
+    }
+    return sentenceFromContext(_effectiveContext, widget.content);
+  }
+
+  /// Creates the translation widget. Only changes fields: call it inside
+  /// setState, in initState or from [_select].
+  void _createTranslation() {
+    _translationInitialized = true;
+    _translationVersion++;
+    _translationWidget = translateText(
+      _sourceText(),
+      service: TranslateService.ai,
+      contextText: _scope == 0 ? _effectiveContext : null,
+    );
+  }
+
+  void _startTranslation() {
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted || _translationInitialized || _tab != 0) return;
+      setState(_createTranslation);
     });
+  }
+
+  Future<void> _setScope(int scope) async {
+    _userInteracted = true;
+    if (scope == _scope) return;
+    _debounceTimer?.cancel();
+    if (scope != 0) {
+      _blocksFuture ??= _loadBlocks();
+    }
+    setState(() {
+      _scope = scope;
+      _translationWidget = null;
+      _translationInitialized = true;
+    });
+    if (scope != 0) {
+      final blocks = await _blocksFuture!;
+      if (!mounted || _scope != scope) return;
+      _blocks = blocks;
+    }
+    setState(_createTranslation);
   }
 
   void _onLanguageChanged() {
     _debounceTimer?.cancel();
+    _userInteracted = true;
     setState(() {
       _version++;
       _tab = 0;
@@ -120,12 +250,7 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         ..add(0);
       _explainContext = null;
       _whoContext = null;
-      _translationWidget = translateText(
-        widget.content,
-        service: TranslateService.ai,
-        contextText: _effectiveContext,
-      );
-      _translationInitialized = true;
+      _createTranslation();
     });
   }
 
@@ -181,35 +306,64 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     return Row(
       children: [
         _langPicker(true),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 6),
-          child: Icon(Icons.arrow_forward_ios, size: 14),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          child: Icon(
+            _answerDirection == TextDirection.rtl
+                ? Icons.arrow_back_ios
+                : Icons.arrow_forward_ios,
+            size: 14,
+          ),
         ),
         _langPicker(false),
       ],
     );
   }
 
+  Widget _scopeChips() {
+    final labels = [
+      _t('المحدد', 'Selection'),
+      _t('الجملة', 'Sentence'),
+      _t('الفقرة', 'Paragraph'),
+    ];
+    return Wrap(
+      spacing: 6,
+      children: [
+        for (var i = 0; i < 3; i++)
+          ChoiceChip(
+            label: Text(labels[i], style: const TextStyle(fontSize: 12)),
+            selected: _scope == i,
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            onSelected: (_) => _setScope(i),
+          ),
+      ],
+    );
+  }
+
   Widget _translateBody() {
+    final source = _sourceText();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
+        _scopeChips(),
+        const SizedBox(height: 6),
         Text(
-          widget.content,
-          maxLines: 4,
+          source,
+          maxLines: _scope == 2 ? 3 : 4,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 16),
+          textDirection: _looksRtl(source)
+              ? TextDirection.rtl
+              : TextDirection.ltr,
+          style: const TextStyle(fontSize: 15),
         ),
         const SizedBox(height: 8),
-        Directionality(
-          textDirection: _answerDirection,
-          child: KeyedSubtree(
-            key: ValueKey('translation-$_version'),
-            child:
-                _translationWidget ??
-                const SizedBox(height: 20, child: Center(child: Text('...'))),
-          ),
+        KeyedSubtree(
+          key: ValueKey('translation-$_translationVersion'),
+          child:
+              _translationWidget ??
+              const SizedBox(height: 20, child: Center(child: Text('...'))),
         ),
       ],
     );
@@ -219,25 +373,11 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   // AI tabs (Explain / Who is it)
   // ---------------------------------------------------------------------------
 
-  /// Reads the book text from the reader WebView, strictly up to the end of
-  /// the page on screen. On any problem it fails instead of guessing.
-  Future<ReadingAssistContext> _loadContext({required bool scan}) async {
-    try {
-      final controller = epubPlayerKey.currentState?.webViewController;
-      if (controller == null) {
-        return const ReadingAssistContext.failed('no-reader');
-      }
-      final script = buildContextScript(
-        query: widget.content.trim(),
-        scan: scan,
-        recentChars: scan ? 1200 : 2500,
-      );
-      final result = await controller
-          .callAsyncJavaScript(functionBody: script)
-          .timeout(const Duration(seconds: 30));
-      return parseContextResult(result.value);
-    } catch (e) {
-      return const ReadingAssistContext.failed('error');
+  void _prepareAiTab(int index) {
+    if (index == 1) {
+      _explainContext ??= _loadContext(scan: false);
+    } else if (index == 2) {
+      _whoContext ??= _loadContext(scan: true);
     }
   }
 
@@ -302,53 +442,50 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
 
   Widget _aiBody({required bool who}) {
     final future = who ? _whoContext : _explainContext;
-    return Directionality(
-      textDirection: _answerDirection,
-      child: FutureBuilder<ReadingAssistContext>(
-        future: future,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return _hint(
-              _t(
-                'أقرأ ما وصلتَ إليه من الكتاب…',
-                'Reading what you have read so far…',
-              ),
-            );
-          }
-          final ctx = snapshot.data;
-          if (ctx == null || !ctx.ok) {
-            return _hint(_failureMessage(ctx?.reason ?? 'unknown'));
-          }
-          final target = Prefs().translateTo;
-          final language = target == LangListEnum.auto
-              ? (_arabic ? 'العربية' : 'English')
-              : target.nativeName;
-          final prompt = who
-              ? buildWhoPrompt(
-                  language: language,
-                  selected: widget.content,
-                  context: ctx,
-                )
-              : buildExplainPrompt(
-                  language: language,
-                  selected: widget.content,
-                  contextSentence: _effectiveContext,
-                  recent: ctx.recent,
-                );
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _caption(),
-              AiStream(
-                key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
-                prompt: _payload(prompt),
-                regenerate: true,
-              ),
-            ],
+    return FutureBuilder<ReadingAssistContext>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return _hint(
+            _t(
+              'أقرأ ما وصلتَ إليه من الكتاب…',
+              'Reading what you have read so far…',
+            ),
           );
-        },
-      ),
+        }
+        final ctx = snapshot.data;
+        if (ctx == null || !ctx.ok) {
+          return _hint(_failureMessage(ctx?.reason ?? 'unknown'));
+        }
+        final target = Prefs().translateTo;
+        final language = target == LangListEnum.auto
+            ? (_arabic ? 'العربية' : 'English')
+            : target.nativeName;
+        final prompt = who
+            ? buildWhoPrompt(
+                language: language,
+                selected: widget.content,
+                context: ctx,
+              )
+            : buildExplainPrompt(
+                language: language,
+                selected: widget.content,
+                contextSentence: _effectiveContext,
+                recent: ctx.recent,
+              );
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _caption(),
+            AiStream(
+              key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
+              prompt: _payload(prompt),
+              regenerate: true,
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -356,17 +493,20 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   // Tabs
   // ---------------------------------------------------------------------------
 
-  void _select(int index) {
+  void _select(int index, {bool manual = true}) {
+    if (manual) _userInteracted = true;
     if (index == _tab) return;
-    setState(() {
-      _tab = index;
-      _opened.add(index);
-      if (index == 1) {
-        _explainContext ??= _loadContext(scan: false);
-      } else if (index == 2) {
-        _whoContext ??= _loadContext(scan: true);
+    _tab = index;
+    _opened.add(index);
+    if (index == 0) {
+      if (!_translationInitialized) {
+        _debounceTimer?.cancel();
+        _createTranslation();
       }
-    });
+    } else {
+      _prepareAiTab(index);
+    }
+    setState(() {});
   }
 
   Widget _tabButton(int index, IconData icon, String label) {
@@ -442,42 +582,47 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         curve: Curves.easeOut,
         child: Material(
           type: MaterialType.transparency,
-          child: Container(
-            height: cardHeight,
-            width: double.infinity,
-            decoration: widget.decoration,
-            padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    _tabButton(0, Icons.translate, _t('ترجمة', 'Translate')),
-                    _tabButton(
-                      1,
-                      Icons.lightbulb_outline,
-                      _t('شرح', 'Explain'),
-                    ),
-                    _tabButton(
-                      2,
-                      Icons.person_search_outlined,
-                      _t('من هذا؟', 'Who is it?'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Expanded(
-                  child: IndexedStack(
-                    index: _tab,
-                    sizing: StackFit.expand,
+          // Everything in the card follows the answer language: with Arabic the
+          // tabs, chips and text run from right to left.
+          child: Directionality(
+            textDirection: _answerDirection,
+            child: Container(
+              height: cardHeight,
+              width: double.infinity,
+              decoration: widget.decoration,
+              padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
                     children: [
-                      for (var i = 0; i < 3; i++)
-                        SingleChildScrollView(child: _bodyFor(i)),
+                      _tabButton(0, Icons.translate, _t('ترجمة', 'Translate')),
+                      _tabButton(
+                        1,
+                        Icons.lightbulb_outline,
+                        _t('شرح', 'Explain'),
+                      ),
+                      _tabButton(
+                        2,
+                        Icons.person_search_outlined,
+                        _t('من هذا؟', 'Who is it?'),
+                      ),
                     ],
                   ),
-                ),
-                if (_tab == 0) ...[const Divider(height: 8), _languageRow()],
-              ],
+                  const SizedBox(height: 6),
+                  Expanded(
+                    child: IndexedStack(
+                      index: _tab,
+                      sizing: StackFit.expand,
+                      children: [
+                        for (var i = 0; i < 3; i++)
+                          SingleChildScrollView(child: _bodyFor(i)),
+                      ],
+                    ),
+                  ),
+                  if (_tab == 0) ...[const Divider(height: 8), _languageRow()],
+                ],
+              ),
             ),
           ),
         ),
