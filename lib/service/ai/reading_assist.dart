@@ -52,10 +52,12 @@ String buildContextScript({
   required String query,
   required bool scan,
   int recentChars = 2500,
+  bool nameCheck = false,
 }) {
   final config = jsonEncode({
     'query': query,
     'scan': scan,
+    'nameCheck': nameCheck,
     'recentChars': recentChars,
     'window': 220,
     'first': 3,
@@ -99,6 +101,287 @@ ReadingAssistContext parseContextResult(Object? raw) {
   } catch (e) {
     return ReadingAssistContext.failed('parse-error');
   }
+}
+
+/// Result of the "is this selection a proper name?" check.
+class NameCheckResult {
+  const NameCheckResult({
+    required this.ok,
+    this.lower = 0,
+    this.capMid = 0,
+    this.capStart = 0,
+  });
+
+  final bool ok;
+
+  /// Times it appears in lower case in the text read so far (a common word).
+  final int lower;
+
+  /// Times it appears capitalised in the middle of a sentence.
+  final int capMid;
+
+  /// Times it appears capitalised at the start of a sentence.
+  final int capStart;
+
+  /// A word that is never written in lower case but is capitalised in the
+  /// middle of sentences behaves like a name (character, place, people).
+  bool get looksLikeName => ok && lower == 0 && capMid >= 1;
+}
+
+NameCheckResult parseNameCheckResult(Object? raw) {
+  if (raw is! String || raw.isEmpty) return const NameCheckResult(ok: false);
+  try {
+    final map = jsonDecode(raw);
+    if (map is! Map || map['ok'] != true) {
+      return const NameCheckResult(ok: false);
+    }
+    return NameCheckResult(
+      ok: true,
+      lower: (map['lower'] as num?)?.toInt() ?? 0,
+      capMid: (map['capMid'] as num?)?.toInt() ?? 0,
+      capStart: (map['capStart'] as num?)?.toInt() ?? 0,
+    );
+  } catch (e) {
+    return const NameCheckResult(ok: false);
+  }
+}
+
+/// The sentence and paragraph around the current selection.
+class ReadingAssistBlocks {
+  const ReadingAssistBlocks({
+    required this.ok,
+    this.sentence = '',
+    this.paragraph = '',
+    this.reason = '',
+  });
+
+  final bool ok;
+  final String sentence;
+  final String paragraph;
+  final String reason;
+}
+
+String buildBlocksScript({int maxParagraph = 4000}) {
+  return _blocksScript.replaceAll(
+    '__CONFIG__',
+    jsonEncode({'maxParagraph': maxParagraph}),
+  );
+}
+
+ReadingAssistBlocks parseBlocksResult(Object? raw) {
+  if (raw is! String || raw.isEmpty) {
+    return const ReadingAssistBlocks(ok: false, reason: 'no-result');
+  }
+  try {
+    final map = jsonDecode(raw);
+    if (map is! Map) {
+      return const ReadingAssistBlocks(ok: false, reason: 'bad-result');
+    }
+    if (map['ok'] != true) {
+      return ReadingAssistBlocks(ok: false, reason: '${map['reason']}');
+    }
+    return ReadingAssistBlocks(
+      ok: true,
+      sentence: '${map['sentence'] ?? ''}',
+      paragraph: '${map['paragraph'] ?? ''}',
+    );
+  } catch (e) {
+    return const ReadingAssistBlocks(ok: false, reason: 'parse-error');
+  }
+}
+
+/// Which tab the card should open on.
+class TabGuess {
+  const TabGuess(this.tab, {this.needsNameCheck = false});
+
+  /// 0 = translate, 1 = explain, 2 = who is it.
+  final int tab;
+
+  /// The selection is capitalised at a sentence start, so the book text must
+  /// be checked before deciding whether it is a name.
+  final bool needsNameCheck;
+}
+
+final RegExp _arabicScript = RegExp(
+  r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]',
+);
+final RegExp _edgePunctuation = RegExp(
+  r'^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$',
+  unicode: true,
+);
+const Set<String> _nameConnectors = {
+  'of',
+  'the',
+  'de',
+  'del',
+  'della',
+  'di',
+  'da',
+  'du',
+  'des',
+  'le',
+  'la',
+  'les',
+  'el',
+  'al',
+  'bin',
+  'ibn',
+  'ben',
+  'von',
+  'van',
+  'der',
+  'den',
+  'and',
+  'y',
+  'e',
+  'in',
+  'on',
+  'at',
+  'for',
+};
+const String _quoteChars = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb()[]';
+const String _stopChars = '.!?\u2026\u061f\u06d4';
+
+bool _isCapitalized(String token) {
+  if (token.isEmpty) return false;
+  final first = String.fromCharCode(token.runes.first);
+  return first != first.toLowerCase();
+}
+
+bool _looksLikeProperName(List<String> tokens) {
+  if (tokens.isEmpty) return false;
+  if (tokens.length == 1) {
+    return tokens.first.runes.length >= 2 && _isCapitalized(tokens.first);
+  }
+  if (!_isCapitalized(tokens.first) || !_isCapitalized(tokens.last)) {
+    return false;
+  }
+  for (var i = 1; i < tokens.length - 1; i++) {
+    final t = tokens[i];
+    if (!_isCapitalized(t) && !_nameConnectors.contains(t.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+enum _SentencePosition { middle, start, unknown }
+
+_SentencePosition _positionInContext(String text, String? contextText) {
+  final c = (contextText ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (c.isEmpty) return _SentencePosition.unknown;
+  var best = -1;
+  var bestDistance = double.infinity;
+  var from = 0;
+  while (true) {
+    final i = c.indexOf(text, from);
+    if (i < 0) break;
+    final d = (i + text.length / 2 - c.length / 2).abs();
+    if (d < bestDistance) {
+      best = i;
+      bestDistance = d;
+    }
+    from = i + 1;
+  }
+  if (best < 0) return _SentencePosition.unknown;
+  var i = best - 1;
+  while (i >= 0 && (c[i] == ' ' || _quoteChars.contains(c[i]))) {
+    i--;
+  }
+  if (i < 0) return _SentencePosition.unknown;
+  return _stopChars.contains(c[i])
+      ? _SentencePosition.start
+      : _SentencePosition.middle;
+}
+
+/// Decides which tab to open first, without any network call.
+///  * a capitalised word in the middle of a sentence (Alexander, Babylon,
+///    Tower of Babel) is almost always a name -> "Who is it?"
+///  * capitalised at a sentence start -> unclear, the book text is checked
+///  * Arabic-script selections need no translation into Arabic
+///  * everything else (lower case words, phrases, sentences) -> translate
+TabGuess guessInitialTab({
+  required String selected,
+  String? contextText,
+  required bool answerIsArabic,
+}) {
+  final text = selected.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (text.isEmpty || text.length > 60) return const TabGuess(0);
+  final tokens = text
+      .split(' ')
+      .map((t) => t.replaceAll(_edgePunctuation, ''))
+      .where((t) => t.isNotEmpty)
+      .toList();
+  if (tokens.isEmpty || tokens.length > 4) return const TabGuess(0);
+
+  if (answerIsArabic && _arabicScript.hasMatch(text)) {
+    return TabGuess(tokens.length <= 3 ? 2 : 1);
+  }
+  if (!_looksLikeProperName(tokens)) return const TabGuess(0);
+
+  switch (_positionInContext(text, contextText)) {
+    case _SentencePosition.middle:
+      return const TabGuess(2);
+    case _SentencePosition.start:
+    case _SentencePosition.unknown:
+      return const TabGuess(0, needsNameCheck: true);
+  }
+}
+
+final RegExp _sentenceBreak = RegExp(
+  r'[.!?\u2026\u061f\u06d4]+["\u0027\u201d\u2019\u00bb)\]]*\s+',
+);
+final RegExp _abbreviationBefore = RegExp(
+  r'(?:^|[\s(\u201c"])(?:Mr|Mrs|Ms|Dr|Prof|St|Sr|Jr|Mt|vs|etc|Fig|No|Vol|Inc|Ltd|Co|[A-Z])$',
+);
+
+/// Fallback when the page cannot be queried: the sentence around the
+/// selection, taken from the short context text (about 240 characters).
+String sentenceFromContext(String? contextText, String selected) {
+  final sel = selected.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final c = (contextText ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (c.isEmpty || sel.isEmpty) return sel;
+  var idx = -1;
+  var bestDistance = double.infinity;
+  var from = 0;
+  while (true) {
+    final i = c.indexOf(sel, from);
+    if (i < 0) break;
+    final d = (i + sel.length / 2 - c.length / 2).abs();
+    if (d < bestDistance) {
+      idx = i;
+      bestDistance = d;
+    }
+    from = i + 1;
+  }
+  if (idx < 0) return sel;
+  final bounds = <int>[0];
+  for (final m in _sentenceBreak.allMatches(c)) {
+    if (c[m.start] == '.' &&
+        _abbreviationBefore.hasMatch(
+          c.substring(m.start < 12 ? 0 : m.start - 12, m.start),
+        )) {
+      continue;
+    }
+    if (m.end < c.length) {
+      final next = c[m.end];
+      if (next == next.toLowerCase() && next != next.toUpperCase()) continue;
+    }
+    bounds.add(m.end);
+  }
+  var s = 0;
+  for (final b in bounds) {
+    if (b <= idx) s = b;
+  }
+  var e = c.length;
+  for (final b in bounds) {
+    if (b >= idx + sel.length && b > s) {
+      e = b;
+      break;
+    }
+  }
+  final result = c.substring(s, e).trim();
+  return result.length < sel.length ? sel : result;
 }
 
 String _clip(String text, int max) {
@@ -222,6 +505,10 @@ try {
     return String(s || '').replace(/\s+/g, ' ').trim();
   };
 
+  const esc = function (s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  };
+
   // Text of the current chapter from its start to the END OF THE VISIBLE PAGE.
   const upTo = doc.createRange();
   upTo.setStart(doc.body, 0);
@@ -236,11 +523,38 @@ try {
     skipped: 0,
     partsScanned: 1,
   };
+  if (cfg.nameCheck) {
+    // Is the selection a proper name? Count, in the text read so far in this
+    // chapter, how often it appears in lower case, capitalised mid-sentence,
+    // and capitalised at the start of a sentence.
+    const term = norm(cfg.query);
+    if (!term) return fail('empty');
+    const rx = new RegExp(
+      '(^|[^\\p{L}\\p{M}\\p{N}_])(' + esc(term) + ')(?![\\p{L}\\p{M}\\p{N}_])',
+      'giu'
+    );
+    const SKIP = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb()[]';
+    const STOP = '.!?\u2026\u061f\u06d4';
+    let lower = 0;
+    let capMid = 0;
+    let capStart = 0;
+    let mm;
+    while ((mm = rx.exec(currentText)) !== null) {
+      const tok = mm[2];
+      const first = tok.charAt(0);
+      if (first === first.toLowerCase() && first !== first.toUpperCase()) {
+        lower++;
+      } else if (first !== first.toLowerCase()) {
+        let i = mm.index + mm[1].length - 1;
+        while (i >= 0 && (currentText[i] === ' ' || SKIP.indexOf(currentText[i]) !== -1)) i--;
+        if (i < 0 || STOP.indexOf(currentText[i]) !== -1) capStart++;
+        else capMid++;
+      }
+      if (lower + capMid + capStart >= 2000) break;
+    }
+    return JSON.stringify({ ok: true, kind: 'name', lower: lower, capMid: capMid, capStart: capStart });
+  }
   if (!cfg.scan) return JSON.stringify(out);
-
-  const esc = function (s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  };
 
   // Search terms: the whole selection, plus capitalised words (names) or
   // words of caseless scripts when several words were selected.
@@ -323,6 +637,86 @@ try {
   }
   out.snippets = chosen;
   return JSON.stringify(out);
+} catch (e) {
+  return fail('error:' + String(e && e.message ? e.message : e));
+}''';
+
+const String _blocksScript = r'''
+const cfg = __CONFIG__;
+const fail = function (reason) {
+  return JSON.stringify({ ok: false, reason: reason });
+};
+try {
+  const view = reader && reader.view;
+  if (!view) return fail('no-view');
+
+  // Find the document that currently holds the selection.
+  let doc = null;
+  let range = null;
+  const contents = view.renderer.getContents();
+  for (let i = 0; i < contents.length; i++) {
+    const d = contents[i] && contents[i].doc;
+    const sel = d && d.getSelection ? d.getSelection() : null;
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+      doc = d;
+      range = sel.getRangeAt(0);
+      break;
+    }
+  }
+  if (!range) return fail('no-selection');
+
+  // Nearest block-level element around the start of the selection.
+  const BLOCK = /^(P|DIV|LI|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|TD|TH|DD|DT|PRE|FIGCAPTION|ASIDE|BODY)$/i;
+  const startNode = range.startContainer;
+  let block = startNode.nodeType === 1 ? startNode : startNode.parentElement;
+  while (block && !BLOCK.test(block.tagName)) block = block.parentElement;
+  if (!block) block = doc.body;
+
+  const text = block.textContent || '';
+  const before = doc.createRange();
+  before.setStart(block, 0);
+  before.setEnd(range.startContainer, range.startOffset);
+  const startOff = before.toString().length;
+  const endOff = startOff + range.toString().length;
+
+  // Sentence boundaries: end punctuation (+ closing quotes) followed by space.
+  const ABBR = /(?:^|[\s(\u201c"'\u2018])(?:Mr|Mrs|Ms|Dr|Prof|St|Sr|Jr|Mt|vs|etc|Fig|No|Vol|Inc|Ltd|Co|[A-Z])$/;
+  const bounds = [0];
+  const re = /[.!?\u2026\u061f\u06d4]+["'\u201d\u2019\u00bb)\]]*\s+/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m[0].charAt(0) === '.' && ABBR.test(text.slice(Math.max(0, m.index - 12), m.index))) {
+      continue;
+    }
+    // A lower-case letter right after the break means the sentence goes on
+    // ("3 p.m. today", "\u201cWhy?\u201d he asked").
+    const next = text.charAt(m.index + m[0].length);
+    if (next && next === next.toLowerCase() && next !== next.toUpperCase()) continue;
+    bounds.push(m.index + m[0].length);
+  }
+  let s = 0;
+  for (let i = 0; i < bounds.length; i++) if (bounds[i] <= startOff) s = bounds[i];
+  let e = text.length;
+  for (let i = 0; i < bounds.length; i++) {
+    if (bounds[i] >= endOff && bounds[i] > s) {
+      e = bounds[i];
+      break;
+    }
+  }
+
+  const norm = function (t) {
+    return String(t || '').replace(/\s+/g, ' ').trim();
+  };
+  let paragraph = norm(text);
+  if (paragraph.length > cfg.maxParagraph) {
+    const from = Math.max(0, startOff - Math.floor(cfg.maxParagraph / 2));
+    paragraph = norm(text.slice(from, from + cfg.maxParagraph));
+  }
+  return JSON.stringify({
+    ok: true,
+    sentence: norm(text.slice(s, e)).slice(0, cfg.maxParagraph),
+    paragraph: paragraph,
+  });
 } catch (e) {
   return fail('error:' + String(e && e.message ? e.message : e));
 }''';
