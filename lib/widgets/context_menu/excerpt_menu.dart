@@ -1,11 +1,14 @@
+// FILE PATH: lib/widgets/context_menu/excerpt_menu.dart  (existing file, modified)
 import 'package:anx_reader/config/shared_preference_provider.dart';
 import 'package:anx_reader/constants/note_annotations.dart';
 import 'package:anx_reader/dao/book_note.dart';
+import 'package:anx_reader/enums/lang_list.dart';
 import 'package:anx_reader/enums/search_display_mode.dart';
 import 'package:anx_reader/l10n/generated/L10n.dart';
 import 'package:anx_reader/main.dart';
 import 'package:anx_reader/models/book_note.dart';
 import 'package:anx_reader/page/reading_page.dart';
+import 'package:anx_reader/service/notes/apply_everywhere.dart';
 import 'package:anx_reader/service/tts/tts_handler.dart';
 import 'package:anx_reader/utils/env_var.dart';
 import 'package:anx_reader/utils/toast/common.dart';
@@ -108,8 +111,11 @@ class ExcerptMenuState extends State<ExcerptMenu> {
     }
   }
 
-  Future<BookNote> _persistNote(
-      {String? color, String? type, String? content}) async {
+  Future<BookNote> _persistNote({
+    String? color,
+    String? type,
+    String? content,
+  }) async {
     final existingNote = await _fetchLatestNote() ?? _currentNote;
     final now = DateTime.now();
 
@@ -157,10 +163,7 @@ class ExcerptMenuState extends State<ExcerptMenu> {
 
   Icon deleteIcon() {
     return deleteConfirm
-        ? const Icon(
-            EvaIcons.close_circle,
-            color: Colors.red,
-          )
+        ? const Icon(EvaIcons.close_circle, color: Colors.red)
         : const Icon(Icons.delete);
   }
 
@@ -207,13 +210,27 @@ class ExcerptMenuState extends State<ExcerptMenu> {
     epubPlayerKey.currentState!.addAnnotation(bookNote);
   }
 
+  /// Highlights this selection and every other occurrence of it in the whole
+  /// book, in the current style and colour (permanent, after confirmation).
+  Future<void> highlightAllOccurrences() async {
+    final bookNote = await _persistNote();
+    epubPlayerKey.currentState!.addAnnotation(bookNote);
+    if (!mounted) return;
+    final done = await applyToEveryOccurrence(context, source: bookNote);
+    if (done) widget.onClose();
+  }
+
+  /// Outlines every occurrence while reading (not saved); press again to remove.
+  Future<void> toggleOccurrenceMarks() async {
+    await toggleTemporaryMarks(context, widget.annoContent);
+    if (mounted) setState(() {});
+  }
+
   Widget iconButton({required Icon icon, required Function() onPressed}) {
     return IconButton(
       padding: const EdgeInsets.all(2),
       constraints: const BoxConstraints(),
-      style: const ButtonStyle(
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      ),
+      style: const ButtonStyle(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
       icon: icon,
       onPressed: onPressed,
     );
@@ -221,10 +238,7 @@ class ExcerptMenuState extends State<ExcerptMenu> {
 
   Widget colorButton(String color) {
     return iconButton(
-      icon: Icon(
-        Icons.circle,
-        color: Color(int.parse('0x88$color')),
-      ),
+      icon: Icon(Icons.circle, color: Color(int.parse('0x88$color'))),
       onPressed: () {
         onColorSelected(color);
       },
@@ -233,8 +247,10 @@ class ExcerptMenuState extends State<ExcerptMenu> {
 
   Widget typeButton(String type, IconData icon) {
     return iconButton(
-      icon: Icon(icon,
-          color: annoType == type ? Color(int.parse('0xff$annoColor')) : null),
+      icon: Icon(
+        icon,
+        color: annoType == type ? Color(int.parse('0xff$annoColor')) : null,
+      ),
       onPressed: () {
         onTypeSelected(type);
       },
@@ -250,12 +266,31 @@ class ExcerptMenuState extends State<ExcerptMenu> {
         axis: widget.axis,
         mainAxisSize: MainAxisSize.min,
         children: [
-          iconButton(
-            onPressed: deleteHandler,
-            icon: deleteIcon(),
-          ),
+          iconButton(onPressed: deleteHandler, icon: deleteIcon()),
           for (final type in notesType) typeButton(type.type, type.icon),
           for (String color in notesColors) colorButton(color),
+          Tooltip(
+            message: Prefs().translateTo == LangListEnum.arabic
+                ? 'تمييز مؤقت لكل المطابقات (اضغط مرة أخرى للإزالة)'
+                : 'Temporarily mark every match (press again to remove)',
+            child: iconButton(
+              icon: Icon(
+                temporaryMarksActive(widget.annoContent)
+                    ? Icons.visibility_off_outlined
+                    : Icons.visibility_outlined,
+              ),
+              onPressed: toggleOccurrenceMarks,
+            ),
+          ),
+          Tooltip(
+            message: Prefs().translateTo == LangListEnum.arabic
+                ? 'تظليل دائم لكل المطابقات في الكتاب'
+                : 'Highlight every match in the book (saved)',
+            child: iconButton(
+              icon: const Icon(Icons.format_color_fill),
+              onPressed: highlightAllOccurrences,
+            ),
+          ),
         ],
       ),
     );
@@ -411,7 +446,9 @@ class ExcerptMenuState extends State<ExcerptMenu> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               SingleChildScrollView(
-                  scrollDirection: widget.axis, child: operatorMenu),
+                scrollDirection: widget.axis,
+                child: operatorMenu,
+              ),
               const SizedBox.square(dimension: 10),
               if (!widget.footnote)
                 SingleChildScrollView(
