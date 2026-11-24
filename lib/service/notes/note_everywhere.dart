@@ -50,14 +50,22 @@ String buildFindEverywhereScript({
   required String query,
   int max = 1500,
   bool wholeWords = true,
+
+  /// Keep the reader's search marks (teal outlines) on every match instead of
+  /// clearing them, to show all occurrences while reading.
+  bool keepMarks = false,
 }) {
   final config = jsonEncode({
     'query': query,
     'max': max,
     'wholeWords': wholeWords,
+    'keep': keepMarks,
   }).replaceAll('\u2028', r'\u2028').replaceAll('\u2029', r'\u2029');
   return 'const cfg = $config;\n$_findScript';
 }
+
+/// Removes the reader's search marks (the teal outlines).
+String buildClearSearchMarksScript() => _clearSearchScript;
 
 EverywhereFind parseFindEverywhere(Object? raw) {
   if (raw is! String || raw.isEmpty) {
@@ -233,6 +241,7 @@ String buildRemoveAnnotationsScript(List<String> cfis) {
 
 const String _findScript = r'''
 const cleanup = function () {
+  if (cfg.keep) return;
   try {
     reader.view.clearSearch();
   } catch (e) {}
@@ -272,5 +281,12 @@ try {
 } catch (e) {
   cleanup();
   return JSON.stringify({ ok: false, reason: String(e && e.message ? e.message : e) });
-}
-''';
+}''';
+
+const String _clearSearchScript = r'''
+try {
+  reader.view.clearSearch();
+  return JSON.stringify({ ok: true });
+} catch (e) {
+  return JSON.stringify({ ok: false, reason: String(e && e.message ? e.message : e) });
+}''';
