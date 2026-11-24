@@ -161,11 +161,34 @@ class ReadingAssistBlocks {
   final String reason;
 }
 
-String buildBlocksScript({int maxParagraph = 4000}) {
+/// Key of the temporary overlay that colours the translated sentence or
+/// paragraph. It starts with "foliate-search:" so taps on it are ignored by
+/// the reader and it never turns into a note.
+const String assistMarkKey = 'foliate-search:anx-assist-scope';
+
+/// Reads the sentence and paragraph around the current selection.
+/// [mark] also colours that part of the page: 0 removes the colour,
+/// 1 colours the sentence, 2 colours the paragraph, null leaves it alone.
+String buildBlocksScript({
+  int maxParagraph = 4000,
+  int? mark,
+  String markColor = '#FFC107',
+}) {
   return _blocksScript.replaceAll(
     '__CONFIG__',
-    jsonEncode({'maxParagraph': maxParagraph}),
+    jsonEncode({
+      'maxParagraph': maxParagraph,
+      'mark': mark,
+      'markKey': assistMarkKey,
+      'markColor': markColor,
+    }),
   );
+}
+
+/// Removes the temporary colour (works even when nothing is selected).
+String buildClearMarkScript() {
+  return 'const cfg = ${jsonEncode({'markKey': assistMarkKey})};\n'
+      '$_clearMarkScript';
 }
 
 ReadingAssistBlocks parseBlocksResult(Object? raw) {
@@ -425,6 +448,39 @@ String buildExplainPrompt({
       '\nText the reader has just read, up to the end of their current '
       'page (most recent last):\n<<<\n$r\n>>>',
     );
+  }
+  return b.toString();
+}
+
+/// Dictionary-style lookup: only the equivalent word, chosen for the sense it
+/// has in its sentence.
+String buildDictionaryPrompt({
+  required String language,
+  required String word,
+  String? sentence,
+}) {
+  final b = StringBuffer();
+  b.writeln('You are a bilingual dictionary built into an e-book reader.');
+  b.writeln(
+    'Give the $language equivalent of the word or phrase below, exactly '
+    'as a dictionary entry would, choosing the sense that fits the sentence '
+    'it appears in.',
+  );
+  b.writeln('\nRules:');
+  b.writeln(
+    '- Output ONLY the $language word or phrase. If one very close '
+    'alternative is truly useful, add it after a comma. At most two items.',
+  );
+  b.writeln(
+    '- No explanation, no example, no transliteration, no quotation '
+    'marks, no grammar labels, no introduction.',
+  );
+  b.writeln('- If it is a proper name, give its usual $language spelling.');
+  b.writeln('- If it is already in $language, give a close synonym instead.');
+  b.writeln('\nWord or phrase:\n<<<\n${_clip(word, 80)}\n>>>');
+  final sent = (sentence ?? '').trim();
+  if (sent.isNotEmpty && sent != word.trim()) {
+    b.writeln('\nThe sentence it appears in:\n<<<\n${_clip(sent, 400)}\n>>>');
   }
   return b.toString();
 }
@@ -704,6 +760,56 @@ try {
     }
   }
 
+  // Optional: colour the sentence / paragraph in the page (temporary overlay).
+  // The key starts with "foliate-search:" so taps on it are ignored by the
+  // reader and it never turns into a note.
+  if (cfg.mark !== null && cfg.mark !== undefined) {
+    let overlayer = null;
+    for (let i = 0; i < contents.length; i++) {
+      if (contents[i] && contents[i].doc === doc) overlayer = contents[i].overlayer;
+    }
+    if (overlayer) {
+      overlayer.remove(cfg.markKey);
+      if (cfg.mark === 1 || cfg.mark === 2) {
+        const mr = doc.createRange();
+        if (cfg.mark === 2) {
+          mr.selectNodeContents(block);
+        } else {
+          let ms = s;
+          let me = e;
+          while (me > ms && /\s/.test(text.charAt(me - 1))) me--;
+          const walker = doc.createTreeWalker(block, 4);
+          let acc = 0;
+          let node;
+          let sNode = null;
+          let sOff = 0;
+          let eNode = null;
+          let eOff = 0;
+          while ((node = walker.nextNode())) {
+            const len = node.nodeValue.length;
+            if (sNode === null && ms < acc + len) {
+              sNode = node;
+              sOff = ms - acc;
+            }
+            if (eNode === null && me <= acc + len) {
+              eNode = node;
+              eOff = me - acc;
+            }
+            acc += len;
+            if (sNode !== null && eNode !== null) break;
+          }
+          if (sNode && eNode) {
+            mr.setStart(sNode, sOff);
+            mr.setEnd(eNode, eOff);
+          } else {
+            mr.selectNodeContents(block);
+          }
+        }
+        overlayer.add(cfg.markKey, mr, overlayer.constructor.highlight, { color: cfg.markColor });
+      }
+    }
+  }
+
   const norm = function (t) {
     return String(t || '').replace(/\s+/g, ' ').trim();
   };
@@ -719,4 +825,16 @@ try {
   });
 } catch (e) {
   return fail('error:' + String(e && e.message ? e.message : e));
+}''';
+
+const String _clearMarkScript = r'''
+try {
+  const contents = reader.view.renderer.getContents();
+  for (let i = 0; i < contents.length; i++) {
+    const o = contents[i] && contents[i].overlayer;
+    if (o) o.remove(cfg.markKey);
+  }
+  return JSON.stringify({ ok: true });
+} catch (e) {
+  return JSON.stringify({ ok: false, reason: String(e && e.message ? e.message : e) });
 }''';
