@@ -1,3 +1,4 @@
+// FILE PATH: lib/widgets/markdown/styled_markdown.dart  (existing file, modified: one line)
 import 'package:anx_reader/widgets/markdown/selection_control.dart';
 import 'package:flutter/material.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
@@ -24,19 +25,23 @@ class StyledMarkdown extends StatelessWidget {
     final baseFontSize = fontSize;
     return SelectableRegion(
       selectionControls: selectionControls(),
-      child: GptMarkdown(data,
-          followLinkColor: true,
-          style:
-              baseFontSize != null ? TextStyle(fontSize: baseFontSize) : null,
-          onLinkTap: (href, text) =>
-              launchUrlString(href, mode: LaunchMode.externalApplication),
-          linkBuilder: (context, text, url, style) => Text.rich(
-                text,
-                style: style.copyWith(
-                  color: theme.colorScheme.primary,
-                  decoration: TextDecoration.underline,
-                ),
-              )),
+      child: GptMarkdown(
+        data,
+        // gpt_markdown is left-to-right by default; follow the surrounding
+        // direction so Arabic answers run right-to-left.
+        textDirection: Directionality.of(context),
+        followLinkColor: true,
+        style: baseFontSize != null ? TextStyle(fontSize: baseFontSize) : null,
+        onLinkTap: (href, text) =>
+            launchUrlString(href, mode: LaunchMode.externalApplication),
+        linkBuilder: (context, text, url, style) => Text.rich(
+          text,
+          style: style.copyWith(
+            color: theme.colorScheme.primary,
+            decoration: TextDecoration.underline,
+          ),
+        ),
+      ),
     );
   }
 }
