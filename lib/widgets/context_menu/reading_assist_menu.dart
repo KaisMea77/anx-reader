@@ -16,7 +16,10 @@ import 'package:langchain_core/prompts.dart'
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 
 /// A card shown under the selection toolbar with three tabs:
-///  * Translate: AI translation in context (selection / sentence / paragraph)
+///  * Translate: a word or short phrase gets a dictionary-style answer (just
+///    the equivalent, chosen for its meaning in the sentence); a sentence or a
+///    paragraph is translated in full, and the part being translated is
+///    coloured in the book while the card is open.
 ///  * Explain:   explains the hard passage, knowing the book only up to your page
 ///  * Who is it: reminds you who a character is / what a place or term is
 ///
@@ -58,8 +61,10 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
 
   /// What the translation covers: 0 = selection, 1 = sentence, 2 = paragraph.
   int _scope = 0;
-  Future<ReadingAssistBlocks>? _blocksFuture;
   ReadingAssistBlocks? _blocks;
+
+  /// True while a sentence/paragraph colour is drawn in the book.
+  bool _markActive = false;
 
   Widget? _translationWidget;
   Timer? _debounceTimer;
@@ -105,6 +110,10 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   @override
   void dispose() {
     _debounceTimer?.cancel();
+    if (_markActive) {
+      // The colour in the book only lives as long as the card.
+      unawaited(_runScript(buildClearMarkScript()));
+    }
     super.dispose();
   }
 
@@ -122,8 +131,11 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       ? TextDirection.rtl
       : TextDirection.ltr;
 
-  static bool _looksRtl(String text) =>
-      RegExp(r'[\u0590-\u08FF]').hasMatch(text);
+  String _targetLanguageName() {
+    final target = Prefs().translateTo;
+    if (target == LangListEnum.auto) return _arabic ? 'العربية' : 'English';
+    return target.nativeName;
+  }
 
   // ---------------------------------------------------------------------------
   // Talking to the reader page
@@ -176,9 +188,11 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     return parseContextResult(raw);
   }
 
-  Future<ReadingAssistBlocks> _loadBlocks() async {
+  /// Reads the sentence/paragraph around the selection and colours it
+  /// (mark: 0 = no colour, 1 = sentence, 2 = paragraph).
+  Future<ReadingAssistBlocks> _loadBlocks({required int mark}) async {
     final raw = await _runScript(
-      buildBlocksScript(),
+      buildBlocksScript(mark: mark),
       timeout: const Duration(seconds: 10),
     );
     return parseBlocksResult(raw);
@@ -187,6 +201,15 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   // ---------------------------------------------------------------------------
   // Translation tab
   // ---------------------------------------------------------------------------
+
+  static bool _isShortLookup(String text) {
+    final t = text.trim();
+    final words = t.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
+    return words >= 1 && words <= 3 && t.length <= 40;
+  }
+
+  /// A word or short phrase is answered like a dictionary entry.
+  bool get _dictionaryMode => _scope == 0 && _isShortLookup(widget.content);
 
   /// The text the translation currently covers.
   String _sourceText() {
@@ -199,16 +222,47 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     return sentenceFromContext(_effectiveContext, widget.content);
   }
 
+  PromptTemplatePayload _payload(String prompt) {
+    final template = ChatPromptTemplate.fromPromptMessages([
+      HumanChatMessagePromptTemplate.fromTemplate('{assist_prompt}'),
+    ]);
+    return PromptTemplatePayload(
+      template: template,
+      variables: {'assist_prompt': prompt},
+      identifier: AiPrompts.translate,
+    );
+  }
+
   /// Creates the translation widget. Only changes fields: call it inside
   /// setState, in initState or from [_select].
   void _createTranslation() {
     _translationInitialized = true;
     _translationVersion++;
-    _translationWidget = translateText(
-      _sourceText(),
-      service: TranslateService.ai,
-      contextText: _scope == 0 ? _effectiveContext : null,
-    );
+    if (_dictionaryMode) {
+      _translationWidget = DefaultTextStyle.merge(
+        style: const TextStyle(
+          fontSize: 26,
+          fontWeight: FontWeight.w700,
+          height: 1.3,
+        ),
+        child: AiStream(
+          prompt: _payload(
+            buildDictionaryPrompt(
+              language: _targetLanguageName(),
+              word: widget.content,
+              sentence: sentenceFromContext(_effectiveContext, widget.content),
+            ),
+          ),
+          regenerate: true,
+        ),
+      );
+    } else {
+      _translationWidget = translateText(
+        _sourceText(),
+        service: TranslateService.ai,
+        contextText: _scope == 0 ? _effectiveContext : null,
+      );
+    }
   }
 
   void _startTranslation() {
@@ -223,19 +277,17 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     _userInteracted = true;
     if (scope == _scope) return;
     _debounceTimer?.cancel();
-    if (scope != 0) {
-      _blocksFuture ??= _loadBlocks();
-    }
     setState(() {
       _scope = scope;
       _translationWidget = null;
       _translationInitialized = true;
     });
-    if (scope != 0) {
-      final blocks = await _blocksFuture!;
-      if (!mounted || _scope != scope) return;
-      _blocks = blocks;
-    }
+    // Colours the sentence/paragraph in the book (or removes the colour) and
+    // returns its text.
+    final blocks = await _loadBlocks(mark: scope);
+    if (!mounted || _scope != scope) return;
+    _blocks = blocks;
+    _markActive = scope != 0 && blocks.ok;
     setState(_createTranslation);
   }
 
@@ -302,68 +354,90 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _languageRow() {
-    return Row(
-      children: [
-        _langPicker(true),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: Icon(
-            _answerDirection == TextDirection.rtl
-                ? Icons.arrow_back_ios
-                : Icons.arrow_forward_ios,
-            size: 14,
+  Widget _languageRow(ColorScheme scheme) {
+    return DefaultTextStyle.merge(
+      style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant),
+      child: Row(
+        children: [
+          Icon(Icons.translate, size: 14, color: scheme.onSurfaceVariant),
+          const SizedBox(width: 8),
+          _langPicker(true),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            child: Icon(
+              _answerDirection == TextDirection.rtl
+                  ? Icons.arrow_back_ios
+                  : Icons.arrow_forward_ios,
+              size: 12,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          _langPicker(false),
+        ],
+      ),
+    );
+  }
+
+  Widget _scopeChip(ColorScheme scheme, int index, String label) {
+    final selected = _scope == index;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _setScope(index),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+        decoration: BoxDecoration(
+          color: selected ? scheme.secondaryContainer : Colors.transparent,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: selected ? Colors.transparent : scheme.outlineVariant,
           ),
         ),
-        _langPicker(false),
-      ],
-    );
-  }
-
-  Widget _scopeChips() {
-    final labels = [
-      _t('المحدد', 'Selection'),
-      _t('الجملة', 'Sentence'),
-      _t('الفقرة', 'Paragraph'),
-    ];
-    return Wrap(
-      spacing: 6,
-      children: [
-        for (var i = 0; i < 3; i++)
-          ChoiceChip(
-            label: Text(labels[i], style: const TextStyle(fontSize: 12)),
-            selected: _scope == i,
-            visualDensity: VisualDensity.compact,
-            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            onSelected: (_) => _setScope(i),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            color: selected
+                ? scheme.onSecondaryContainer
+                : scheme.onSurfaceVariant,
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _scopeChips(ColorScheme scheme) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 6,
+      children: [
+        _scopeChip(scheme, 0, _t('المحدد', 'Selection')),
+        _scopeChip(scheme, 1, _t('الجملة', 'Sentence')),
+        _scopeChip(scheme, 2, _t('الفقرة', 'Paragraph')),
       ],
     );
   }
 
-  Widget _translateBody() {
-    final source = _sourceText();
+  Widget _translateBody(ColorScheme scheme) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        _scopeChips(),
-        const SizedBox(height: 6),
-        Text(
-          source,
-          maxLines: _scope == 2 ? 3 : 4,
-          overflow: TextOverflow.ellipsis,
-          textDirection: _looksRtl(source)
-              ? TextDirection.rtl
-              : TextDirection.ltr,
-          style: const TextStyle(fontSize: 15),
-        ),
-        const SizedBox(height: 8),
+        _scopeChips(scheme),
+        const SizedBox(height: 12),
         KeyedSubtree(
           key: ValueKey('translation-$_translationVersion'),
           child:
               _translationWidget ??
-              const SizedBox(height: 20, child: Center(child: Text('...'))),
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 6),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
         ),
       ],
     );
@@ -381,27 +455,12 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     }
   }
 
-  PromptTemplatePayload _payload(String prompt) {
-    final template = ChatPromptTemplate.fromPromptMessages([
-      HumanChatMessagePromptTemplate.fromTemplate('{assist_prompt}'),
-    ]);
-    return PromptTemplatePayload(
-      template: template,
-      variables: {'assist_prompt': prompt},
-      identifier: AiPrompts.translate,
-    );
-  }
-
-  Widget _hint(String text) {
+  Widget _hint(ColorScheme scheme, String text) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Text(
         text,
-        style: TextStyle(
-          fontSize: 13,
-          color: Theme.of(context).colorScheme.onSecondaryContainer
-              .withValues(alpha: 0.75),
-        ),
+        style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
       ),
     );
   }
@@ -417,11 +476,10 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _caption() {
-    final color = Theme.of(context).colorScheme.onSecondaryContainer
-        .withValues(alpha: 0.6);
+  Widget _caption(ColorScheme scheme) {
+    final color = scheme.onSurfaceVariant.withValues(alpha: 0.8);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.only(bottom: 6),
       child: Row(
         children: [
           Icon(Icons.lock_outline, size: 12, color: color),
@@ -440,13 +498,14 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _aiBody({required bool who}) {
+  Widget _aiBody(ColorScheme scheme, {required bool who}) {
     final future = who ? _whoContext : _explainContext;
     return FutureBuilder<ReadingAssistContext>(
       future: future,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
           return _hint(
+            scheme,
             _t(
               'أقرأ ما وصلتَ إليه من الكتاب…',
               'Reading what you have read so far…',
@@ -455,12 +514,9 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         }
         final ctx = snapshot.data;
         if (ctx == null || !ctx.ok) {
-          return _hint(_failureMessage(ctx?.reason ?? 'unknown'));
+          return _hint(scheme, _failureMessage(ctx?.reason ?? 'unknown'));
         }
-        final target = Prefs().translateTo;
-        final language = target == LangListEnum.auto
-            ? (_arabic ? 'العربية' : 'English')
-            : target.nativeName;
+        final language = _targetLanguageName();
         final prompt = who
             ? buildWhoPrompt(
                 language: language,
@@ -477,11 +533,14 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            _caption(),
-            AiStream(
-              key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
-              prompt: _payload(prompt),
-              regenerate: true,
+            _caption(scheme),
+            DefaultTextStyle.merge(
+              style: const TextStyle(fontSize: 15, height: 1.55),
+              child: AiStream(
+                key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
+                prompt: _payload(prompt),
+                regenerate: true,
+              ),
             ),
           ],
         );
@@ -509,33 +568,28 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     setState(() {});
   }
 
-  Widget _tabButton(int index, IconData icon, String label) {
-    final theme = Theme.of(context);
+  Widget _tabPill(ColorScheme scheme, int index, IconData icon, String label) {
     final selected = _tab == index;
     final color = selected
-        ? theme.colorScheme.primary
-        : theme.colorScheme.onSecondaryContainer.withValues(alpha: 0.65);
+        ? scheme.onPrimaryContainer
+        : scheme.onSurfaceVariant;
     return Expanded(
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onTap: () => _select(index),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 6),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(vertical: 8),
           decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(
-                color: selected
-                    ? theme.colorScheme.primary
-                    : Colors.transparent,
-                width: 2,
-              ),
-            ),
+            color: selected ? scheme.primaryContainer : Colors.transparent,
+            borderRadius: BorderRadius.circular(11),
           ),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(icon, size: 16, color: color),
-              const SizedBox(width: 4),
+              const SizedBox(width: 5),
               Flexible(
                 child: Text(
                   label,
@@ -555,10 +609,49 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _bodyFor(int index) {
+  Widget _tabBar(ColorScheme scheme) {
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          _tabPill(scheme, 0, Icons.translate, _t('ترجمة', 'Translate')),
+          _tabPill(scheme, 1, Icons.lightbulb_outline, _t('شرح', 'Explain')),
+          _tabPill(
+            scheme,
+            2,
+            Icons.person_search_outlined,
+            _t('من هذا؟', 'Who is it?'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bodyFor(ColorScheme scheme, int index) {
     if (!_opened.contains(index)) return const SizedBox.shrink();
-    if (index == 0) return _translateBody();
-    return _aiBody(who: index == 2);
+    if (index == 0) return _translateBody(scheme);
+    return _aiBody(scheme, who: index == 2);
+  }
+
+  BoxDecoration _cardDecoration(ColorScheme scheme) {
+    // Keep the original look in e-ink mode (plain, high contrast).
+    if (Prefs().eInkMode) return widget.decoration;
+    return BoxDecoration(
+      color: scheme.surfaceContainerHigh,
+      borderRadius: BorderRadius.circular(22),
+      border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: 0.18),
+          blurRadius: 20,
+          offset: const Offset(0, 6),
+        ),
+      ],
+    );
   }
 
   @override
@@ -573,8 +666,9 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       );
     }
 
+    final scheme = Theme.of(context).colorScheme;
     final screenHeight = MediaQuery.of(context).size.height;
-    final cardHeight = (screenHeight * 0.42).clamp(190.0, 320.0).toDouble();
+    final cardHeight = (screenHeight * 0.44).clamp(220.0, 360.0).toDouble();
 
     return Expanded(
       child: AnimatedSize(
@@ -589,39 +683,35 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
             child: Container(
               height: cardHeight,
               width: double.infinity,
-              decoration: widget.decoration,
-              padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      _tabButton(0, Icons.translate, _t('ترجمة', 'Translate')),
-                      _tabButton(
-                        1,
-                        Icons.lightbulb_outline,
-                        _t('شرح', 'Explain'),
+              decoration: _cardDecoration(scheme),
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+              child: DefaultTextStyle.merge(
+                style: TextStyle(color: scheme.onSurface),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _tabBar(scheme),
+                    const SizedBox(height: 10),
+                    Expanded(
+                      child: IndexedStack(
+                        index: _tab,
+                        sizing: StackFit.expand,
+                        children: [
+                          for (var i = 0; i < 3; i++)
+                            SingleChildScrollView(child: _bodyFor(scheme, i)),
+                        ],
                       ),
-                      _tabButton(
-                        2,
-                        Icons.person_search_outlined,
-                        _t('من هذا؟', 'Who is it?'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Expanded(
-                    child: IndexedStack(
-                      index: _tab,
-                      sizing: StackFit.expand,
-                      children: [
-                        for (var i = 0; i < 3; i++)
-                          SingleChildScrollView(child: _bodyFor(i)),
-                      ],
                     ),
-                  ),
-                  if (_tab == 0) ...[const Divider(height: 8), _languageRow()],
-                ],
+                    if (_tab == 0) ...[
+                      Divider(
+                        height: 1,
+                        color: scheme.outlineVariant.withValues(alpha: 0.7),
+                      ),
+                      const SizedBox(height: 8),
+                      _languageRow(scheme),
+                    ],
+                  ],
+                ),
               ),
             ),
           ),
