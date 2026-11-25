@@ -10,6 +10,7 @@ import 'package:anx_reader/service/ai/reading_assist.dart';
 import 'package:anx_reader/service/translate/index.dart';
 import 'package:anx_reader/widgets/ai/ai_stream.dart';
 import 'package:anx_reader/widgets/context_menu/translation_menu.dart';
+import 'package:anx_reader/widgets/context_menu/who_recall.dart';
 import 'package:flutter/material.dart';
 import 'package:langchain_core/prompts.dart'
     show ChatPromptTemplate, HumanChatMessagePromptTemplate;
@@ -71,7 +72,6 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   bool _translationInitialized = false;
 
   Future<ReadingAssistContext>? _explainContext;
-  Future<ReadingAssistContext>? _whoContext;
 
   @override
   void initState() {
@@ -130,6 +130,12 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       Prefs().translateTo == LangListEnum.arabic
       ? TextDirection.rtl
       : TextDirection.ltr;
+
+  String _targetLanguageCode() {
+    final target = Prefs().translateTo;
+    if (target == LangListEnum.auto) return _arabic ? 'ar' : 'en';
+    return target.code;
+  }
 
   String _targetLanguageName() {
     final target = Prefs().translateTo;
@@ -301,7 +307,6 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         ..clear()
         ..add(0);
       _explainContext = null;
-      _whoContext = null;
       _createTranslation();
     });
   }
@@ -448,10 +453,9 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   // ---------------------------------------------------------------------------
 
   void _prepareAiTab(int index) {
+    // "Who is it?" (tab 2) gathers its own text and keeps its own notebook.
     if (index == 1) {
       _explainContext ??= _loadContext(scan: false);
-    } else if (index == 2) {
-      _whoContext ??= _loadContext(scan: true);
     }
   }
 
@@ -498,10 +502,9 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _aiBody(ColorScheme scheme, {required bool who}) {
-    final future = who ? _whoContext : _explainContext;
+  Widget _aiBody(ColorScheme scheme) {
     return FutureBuilder<ReadingAssistContext>(
-      future: future,
+      future: _explainContext,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
           return _hint(
@@ -517,18 +520,12 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
           return _hint(scheme, _failureMessage(ctx?.reason ?? 'unknown'));
         }
         final language = _targetLanguageName();
-        final prompt = who
-            ? buildWhoPrompt(
-                language: language,
-                selected: widget.content,
-                context: ctx,
-              )
-            : buildExplainPrompt(
-                language: language,
-                selected: widget.content,
-                contextSentence: _effectiveContext,
-                recent: ctx.recent,
-              );
+        final prompt = buildExplainPrompt(
+          language: language,
+          selected: widget.content,
+          contextSentence: _effectiveContext,
+          recent: ctx.recent,
+        );
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
@@ -537,7 +534,7 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
             DefaultTextStyle.merge(
               style: const TextStyle(fontSize: 15, height: 1.55),
               child: AiStream(
-                key: ValueKey('${who ? 'who' : 'explain'}-$_version'),
+                key: ValueKey('explain-$_version'),
                 prompt: _payload(prompt),
                 regenerate: true,
               ),
@@ -634,7 +631,19 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
   Widget _bodyFor(ColorScheme scheme, int index) {
     if (!_opened.contains(index)) return const SizedBox.shrink();
     if (index == 0) return _translateBody(scheme);
-    return _aiBody(scheme, who: index == 2);
+    if (index == 2) {
+      return DefaultTextStyle.merge(
+        style: const TextStyle(fontSize: 15, height: 1.55),
+        child: WhoRecall(
+          key: ValueKey('who-$_version'),
+          selected: widget.content,
+          languageName: _targetLanguageName(),
+          languageCode: _targetLanguageCode(),
+          arabic: _arabic,
+        ),
+      );
+    }
+    return _aiBody(scheme);
   }
 
   BoxDecoration _cardDecoration(ColorScheme scheme) {
