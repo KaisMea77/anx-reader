@@ -13,11 +13,18 @@
 import 'dart:convert';
 
 class ReadingAssistSnippet {
-  const ReadingAssistSnippet({required this.part, required this.text});
+  const ReadingAssistSnippet({
+    required this.part,
+    required this.text,
+    this.pos = 0,
+  });
 
   /// Zero-based index of the book section (chapter file) the snippet is from.
   final int part;
   final String text;
+
+  /// Character offset of the mention inside that section's text.
+  final int pos;
 }
 
 class ReadingAssistContext {
@@ -29,6 +36,9 @@ class ReadingAssistContext {
     this.mentions = 0,
     this.skipped = 0,
     this.partsScanned = 0,
+    this.positionSection = 0,
+    this.positionOffset = 0,
+    this.newMentions = 0,
   });
 
   const ReadingAssistContext.failed(String reason)
@@ -45,6 +55,15 @@ class ReadingAssistContext {
   final int mentions;
   final int skipped;
   final int partsScanned;
+
+  /// Exact place of the end of the page on screen: section index and the
+  /// character offset inside that section. Used to remember how far the
+  /// reader had read when something was looked up.
+  final int positionSection;
+  final int positionOffset;
+
+  /// Mentions found after the position the search resumed from.
+  final int newMentions;
 }
 
 /// Builds the JavaScript function body passed to `callAsyncJavaScript`.
@@ -53,6 +72,12 @@ String buildContextScript({
   required bool scan,
   int recentChars = 2500,
   bool nameCheck = false,
+  int first = 3,
+  int last = 5,
+
+  /// Resume from an earlier position: only mentions after it are returned.
+  int? sinceSection,
+  int? sinceOffset,
 }) {
   final config = jsonEncode({
     'query': query,
@@ -60,8 +85,11 @@ String buildContextScript({
     'nameCheck': nameCheck,
     'recentChars': recentChars,
     'window': 220,
-    'first': 3,
-    'last': 5,
+    'first': first,
+    'last': last,
+    'since': (sinceSection == null || sinceOffset == null)
+        ? null
+        : {'section': sinceSection, 'offset': sinceOffset},
   }).replaceAll('\u2028', r'\u2028').replaceAll('\u2029', r'\u2029');
   return _contextScript.replaceAll('__CONFIG__', config);
 }
@@ -85,6 +113,7 @@ ReadingAssistContext parseContextResult(Object? raw) {
             ReadingAssistSnippet(
               part: (s['part'] as num?)?.toInt() ?? 0,
               text: '${s['text'] ?? ''}',
+              pos: (s['pos'] as num?)?.toInt() ?? 0,
             ),
           );
         }
@@ -97,6 +126,13 @@ ReadingAssistContext parseContextResult(Object? raw) {
       mentions: (map['mentions'] as num?)?.toInt() ?? 0,
       skipped: (map['skipped'] as num?)?.toInt() ?? 0,
       partsScanned: (map['partsScanned'] as num?)?.toInt() ?? 0,
+      positionSection: (map['position'] is Map)
+          ? ((map['position']['section'] as num?)?.toInt() ?? 0)
+          : 0,
+      positionOffset: (map['position'] is Map)
+          ? ((map['position']['offset'] as num?)?.toInt() ?? 0)
+          : 0,
+      newMentions: (map['newMentions'] as num?)?.toInt() ?? 0,
     );
   } catch (e) {
     return ReadingAssistContext.failed('parse-error');
@@ -421,7 +457,8 @@ Rules:
 2. You may use general knowledge about language, idioms, history, culture and literary allusions to explain meaning.
 3. If the excerpts do not contain enough information, say so briefly instead of guessing.
 4. Write the answer in {LANG}. Be concise and use plain words. No preamble and no closing remarks.
-5. If the book is in a different language from {LANG}, keep character and place names recognisable: write them in {LANG} and give the original spelling in parentheses the first time.''';
+5. If the book is in a different language from {LANG}, keep character and place names recognisable: write them in {LANG} and give the original spelling in parentheses the first time.
+6. Write natural, fluent {LANG}, as a well-read native writer would, never word by word from another language. Prefer flowing prose over bullet points and headings.''';
 
 String buildExplainPrompt({
   required String language,
@@ -573,6 +610,8 @@ try {
 
   const out = {
     ok: true,
+    position: { section: idx, offset: currentText.length },
+    newMentions: 0,
     recent: currentText.slice(-cfg.recentChars),
     snippets: [],
     mentions: 0,
@@ -648,8 +687,9 @@ try {
     return t;
   };
 
+  const since = cfg.since || null;
   const parts = [];
-  for (let i = 0; i < idx; i++) {
+  for (let i = since ? Math.min(since.section, idx) : 0; i < idx; i++) {
     const t = await sectionText(i);
     if (t) parts.push({ part: i, text: t });
   }
@@ -669,11 +709,17 @@ try {
         continue;
       }
       out.mentions++;
-      if (m.index >= lastEnd) {
+      const isNew =
+        !since ||
+        p.part > since.section ||
+        (p.part === since.section && m.index >= since.offset);
+      if (isNew) out.newMentions++;
+      if (isNew && m.index >= lastEnd) {
         const s = Math.max(0, m.index - W);
         const e = Math.min(p.text.length, m.index + m[0].length + W);
         hits.push({
           part: p.part,
+          pos: m.index,
           text:
             (s > 0 ? '\u2026' : '') +
             p.text.slice(s, e) +
