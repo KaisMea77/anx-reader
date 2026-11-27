@@ -1,3 +1,4 @@
+// FILE PATH: lib/widgets/context_menu/context_menu.dart  (existing file, modified)
 import 'dart:math' as math;
 
 import 'package:anx_reader/config/shared_preference_provider.dart';
@@ -155,7 +156,9 @@ Future<void> showContextMenu(
       onClose: onClose,
       menuConstraints: menuConstraints,
       initialPlacement: initialPlacement,
-      showTranslationDefault: !isNewNote && Prefs().autoTranslateSelection,
+      // The assistant sheet opens with every selection (unless a note is
+      // being created right away).
+      showTranslationDefault: !isNewNote,
       horizontalMargin: horizontalMargin,
       verticalMargin: verticalMargin,
       gap: gap,
@@ -571,6 +574,9 @@ class _ContextMenuOverlayState extends State<_ContextMenuOverlay>
                                 decoration: widget.decoration,
                                 axis: widget.axis,
                                 contextText: widget.contextText,
+                                annoCfi: widget.annoCfi,
+                                selectionRect: widget.selectionRect,
+                                onClose: widget.onClose,
                               ),
                             ],
                           ),
