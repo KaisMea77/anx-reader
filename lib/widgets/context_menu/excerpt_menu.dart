@@ -3,6 +3,12 @@ import 'package:anx_reader/config/shared_preference_provider.dart';
 import 'package:anx_reader/constants/note_annotations.dart';
 import 'package:anx_reader/dao/book_note.dart';
 import 'package:anx_reader/enums/lang_list.dart';
+import 'package:anx_reader/models/bookmark.dart';
+import 'package:anx_reader/providers/bookmark.dart';
+import 'package:anx_reader/service/ai/reading_assist.dart'
+    show kAssistEnglishLabels;
+import 'package:anx_reader/widgets/context_menu/who_recall.dart'
+    show AssistPalette;
 import 'package:anx_reader/enums/search_display_mode.dart';
 import 'package:anx_reader/l10n/generated/L10n.dart';
 import 'package:anx_reader/main.dart';
@@ -57,6 +63,10 @@ class ExcerptMenu extends StatefulWidget {
 }
 
 class ExcerptMenuState extends State<ExcerptMenu> {
+  /// The colour bar opens when "Highlight" is tapped (or when an existing
+  /// highlight is being edited).
+  bool _showColors = false;
+
   bool deleteConfirm = false;
   int? noteId;
   BookNote? _currentNote;
@@ -68,6 +78,7 @@ class ExcerptMenuState extends State<ExcerptMenu> {
     super.initState();
     annoType = Prefs().annotationType;
     annoColor = Prefs().annotationColor;
+    _showColors = widget.id != null;
     _initializeExistingNote();
   }
 
@@ -210,6 +221,45 @@ class ExcerptMenuState extends State<ExcerptMenu> {
     epubPlayerKey.currentState!.addAnnotation(bookNote);
   }
 
+  bool get _arabicLabels =>
+      !kAssistEnglishLabels && Prefs().translateTo == LangListEnum.arabic;
+
+  String _label(String ar, String en) => _arabicLabels ? ar : en;
+
+  /// "I'm here": a bookmark at the place of the selection.
+  Future<void> imHere() async {
+    final player = epubPlayerKey.currentState;
+    if (player == null || widget.annoCfi.isEmpty) {
+      AnxToast.show(
+        _label('تعذّر إضافة علامة مرجعية', 'Cannot add a bookmark'),
+      );
+      return;
+    }
+    try {
+      final now = DateTime.now();
+      final bookmark = await player.ref
+          .read(BookmarkProvider(player.widget.book.id).notifier)
+          .addBookmark(
+            BookmarkModel(
+              bookId: player.widget.book.id,
+              cfi: widget.annoCfi,
+              percentage: player.percentage,
+              content: widget.annoContent.trim(),
+              chapter: player.chapterTitle,
+              updateTime: now,
+              createTime: now,
+            ),
+          );
+      player.addBookmark(bookmark);
+      AnxToast.show(_label('تمت إضافة علامة مرجعية', 'Bookmark added'));
+    } catch (e) {
+      AnxToast.show(
+        _label('تعذّر إضافة علامة مرجعية', 'Cannot add a bookmark'),
+      );
+    }
+    widget.onClose();
+  }
+
   /// Highlights this selection and every other occurrence of it in the whole
   /// book, in the current style and colour (permanent, after confirmation).
   Future<void> highlightAllOccurrences() async {
@@ -259,175 +309,151 @@ class ExcerptMenuState extends State<ExcerptMenu> {
 
   @override
   Widget build(BuildContext context) {
-    Widget annotationMenu = Container(
-      padding: const EdgeInsets.all(6),
-      decoration: widget.decoration,
-      child: AxisFlex(
-        axis: widget.axis,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          iconButton(onPressed: deleteHandler, icon: deleteIcon()),
-          for (final type in notesType) typeButton(type.type, type.icon),
-          for (String color in notesColors) colorButton(color),
-          Tooltip(
-            message: Prefs().translateTo == LangListEnum.arabic
-                ? 'تمييز مؤقت لكل المطابقات (اضغط مرة أخرى للإزالة)'
-                : 'Temporarily mark every match (press again to remove)',
-            child: iconButton(
-              icon: Icon(
-                temporaryMarksActive(widget.annoContent)
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
+    final p = AssistPalette.of(context);
+
+    // White floating bars (plain, high contrast in e-ink mode).
+    final BoxDecoration barDecoration = Prefs().eInkMode
+        ? widget.decoration
+        : BoxDecoration(
+            color: p.sheet,
+            borderRadius: BorderRadius.circular(26),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.16),
+                blurRadius: 20,
+                offset: const Offset(0, 6),
               ),
-              onPressed: toggleOccurrenceMarks,
+            ],
+          );
+
+    Widget barButton({
+      required IconData icon,
+      required String label,
+      required VoidCallback onTap,
+      bool active = false,
+    }) {
+      return InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          child: SizedBox(
+            width: 64,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 25, color: active ? p.accent : p.text),
+                const SizedBox(height: 5),
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: active ? p.accent : p.text,
+                  ),
+                ),
+              ],
             ),
           ),
-          Tooltip(
-            message: Prefs().translateTo == LangListEnum.arabic
-                ? 'تظليل دائم لكل المطابقات في الكتاب'
-                : 'Highlight every match in the book (saved)',
-            child: iconButton(
-              icon: const Icon(Icons.format_color_fill),
-              onPressed: highlightAllOccurrences,
+        ),
+      );
+    }
+
+    Widget annotationMenu = Material(
+      type: MaterialType.transparency,
+      child: Container(
+        padding: const EdgeInsets.all(6),
+        decoration: barDecoration,
+        child: AxisFlex(
+          axis: widget.axis,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            iconButton(onPressed: deleteHandler, icon: deleteIcon()),
+            for (final type in notesType) typeButton(type.type, type.icon),
+            for (String color in notesColors) colorButton(color),
+            Tooltip(
+              message: _label(
+                'تمييز مؤقت لكل المطابقات (اضغط مرة أخرى للإزالة)',
+                'Temporarily mark every match (press again to remove)',
+              ),
+              child: iconButton(
+                icon: Icon(
+                  temporaryMarksActive(widget.annoContent)
+                      ? Icons.visibility_off_outlined
+                      : Icons.visibility_outlined,
+                ),
+                onPressed: toggleOccurrenceMarks,
+              ),
             ),
-          ),
-        ],
+            Tooltip(
+              message: _label(
+                'تظليل دائم لكل المطابقات في الكتاب',
+                'Highlight every match in the book (saved)',
+              ),
+              child: iconButton(
+                icon: const Icon(Icons.format_color_fill),
+                onPressed: highlightAllOccurrences,
+              ),
+            ),
+          ],
+        ),
       ),
     );
 
-    Widget operatorMenu = Container(
-      // width: 48,
-      decoration: widget.decoration,
-      child: AxisFlex(
-        axis: widget.axis,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // copy
-          IconAndText(
-            compact: true,
-            onTap: () {
-              Clipboard.setData(ClipboardData(text: widget.annoContent));
-              AnxToast.show(L10n.of(context).notesPageCopied);
-              widget.onClose();
-            },
-            icon: const Icon(EvaIcons.copy),
-            text: L10n.of(context).contextMenuCopy,
-          ),
-          // Web search
-          IconAndText(
-            compact: true,
-            onTap: () {
-              final displayMode = Prefs().searchDisplayMode;
-              final engine = Prefs().selectedSearchEngine;
-              final query = widget.annoContent;
-
-              switch (displayMode) {
-                case SearchDisplayMode.popup:
-                  widget.toggleSearchMenu(show: true, query: query);
-                  break;
-                case SearchDisplayMode.fullScreen:
-                  widget.onClose();
-                  launchUrl(
-                    Uri.parse(engine.buildUrl(query)),
-                    mode: LaunchMode.inAppWebView,
-                  );
-                  break;
-                case SearchDisplayMode.external:
-                  widget.onClose();
-                  launchUrl(
-                    Uri.parse(engine.buildUrl(query)),
-                    mode: LaunchMode.externalApplication,
-                  );
-                  break;
-              }
-            },
-            icon: const Icon(EvaIcons.globe),
-            text: L10n.of(context).contextMenuSearch,
-          ),
-          // toggle translation menu
-          IconAndText(
-            compact: true,
-            onTap: widget.toggleTranslationMenu,
-            icon: const Icon(Icons.translate),
-            text: L10n.of(context).contextMenuTranslate,
-          ),
-          // narrate
-          IconAndText(
-            compact: true,
-            onTap: () async {
-              widget.onClose();
-              final playerState = epubPlayerKey.currentState;
-              if (playerState == null) return;
-
-              // Stop existing TTS playback if any
-              await audioHandler.stop();
-
-              // Now initialize TTS - it will use the current (updated) position
-              await TtsHandler().init(
-                () => playerState.initTts(fromCfi: widget.annoCfi),
-                playerState.ttsNext,
-                playerState.ttsPrev,
-              );
-
-              // Start TTS - audioHandler.play() will call TTS speak
-              await audioHandler.play();
-            },
-            icon: const Icon(Icons.headphones),
-            text: L10n.of(context).contextMenuNarrate,
-          ),
-          // edit note
-          if (!widget.footnote)
-            IconAndText(
-              compact: true,
-              onTap: () async {
-                epubPlayerKey.currentState?.setSelectionClearLocked(true);
-                await onColorSelected(annoColor, close: false);
-                final targetId = noteId ?? widget.id;
-                if (targetId != null) {
-                  await widget.openReaderNoteMenu(targetId);
-                } else {
-                  widget.toggleReaderNoteMenu(show: true);
-                }
-              },
-              icon: const Icon(EvaIcons.edit_2_outline),
-              text: L10n.of(context).contextMenuWriteIdea,
-            ),
-          // AI chat
-          if (EnvVar.enableAIFeature)
-            IconAndText(
-              compact: true,
+    Widget operatorMenu = Material(
+      type: MaterialType.transparency,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: barDecoration,
+        child: AxisFlex(
+          axis: widget.axis,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // highlight: opens the colour bar
+            if (!widget.footnote)
+              barButton(
+                icon: Icons.brush_outlined,
+                label: _label('تظليل', 'Highlight'),
+                active: _showColors,
+                onTap: () => setState(() => _showColors = !_showColors),
+              ),
+            // note
+            if (!widget.footnote)
+              barButton(
+                icon: EvaIcons.edit_2_outline,
+                label: _label('ملاحظة', 'Note'),
+                onTap: () async {
+                  epubPlayerKey.currentState?.setSelectionClearLocked(true);
+                  await onColorSelected(annoColor, close: false);
+                  final targetId = noteId ?? widget.id;
+                  if (targetId != null) {
+                    await widget.openReaderNoteMenu(targetId);
+                  } else {
+                    widget.toggleReaderNoteMenu(show: true);
+                  }
+                },
+              ),
+            // bookmark at this place
+            if (!widget.footnote)
+              barButton(
+                icon: Icons.place_outlined,
+                label: _label('أنا هنا', "I'm here"),
+                onTap: imHere,
+              ),
+            // copy
+            barButton(
+              icon: EvaIcons.copy,
+              label: _label('نسخ', 'Copy'),
               onTap: () {
+                Clipboard.setData(ClipboardData(text: widget.annoContent));
+                AnxToast.show(L10n.of(context).notesPageCopied);
                 widget.onClose();
-                final key = readingPageKey.currentState;
-                if (key != null) {
-                  key.showAiChat(
-                    content: widget.annoContent,
-                    sendImmediate: false,
-                  );
-                  key.aiChatKey.currentState?.inputController.text =
-                      widget.annoContent;
-                }
               },
-              icon: const Icon(EvaIcons.message_circle_outline),
-              text: L10n.of(context).navBarAI,
             ),
-          // share
-          IconAndText(
-            compact: true,
-            onTap: () {
-              widget.onClose();
-              ExcerptShareService.showShareExcerpt(
-                context: context,
-                bookTitle: epubPlayerKey.currentState!.book.title,
-                author: epubPlayerKey.currentState!.book.author,
-                excerpt: widget.annoContent,
-                chapter: epubPlayerKey.currentState!.chapterTitle,
-              );
-            },
-            icon: const Icon(EvaIcons.share_outline),
-            text: L10n.of(context).contextMenuShare,
-          ),
-        ],
+          ],
+        ),
       ),
     );
 
@@ -449,12 +475,13 @@ class ExcerptMenuState extends State<ExcerptMenu> {
                 scrollDirection: widget.axis,
                 child: operatorMenu,
               ),
-              const SizedBox.square(dimension: 10),
-              if (!widget.footnote)
+              if (!widget.footnote && _showColors) ...[
+                const SizedBox.square(dimension: 10),
                 SingleChildScrollView(
                   scrollDirection: widget.axis,
                   child: annotationMenu,
                 ),
+              ],
             ],
           ),
         ],
