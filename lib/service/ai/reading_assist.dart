@@ -75,6 +75,9 @@ String buildContextScript({
   int first = 3,
   int last = 5,
 
+  /// "Whole book" mode: also read the rest of the book (spoilers allowed).
+  bool whole = false,
+
   /// Resume from an earlier position: only mentions after it are returned.
   int? sinceSection,
   int? sinceOffset,
@@ -87,6 +90,7 @@ String buildContextScript({
     'window': 220,
     'first': first,
     'last': last,
+    'whole': whole,
     'since': (sinceSection == null || sinceOffset == null)
         ? null
         : {'section': sinceSection, 'offset': sinceOffset},
@@ -195,6 +199,57 @@ class ReadingAssistBlocks {
   final String sentence;
   final String paragraph;
   final String reason;
+}
+
+/// Set to true to show the card's own labels in English even when the answer
+/// language is Arabic.
+const bool kAssistEnglishLabels = false;
+
+/// Rough size of a request in tokens (about four characters per token).
+int estimateTokens(String text) => (text.length / 4).ceil();
+
+/// Where a name first appears: chapter title, the nearest sub-heading before
+/// it and a place to jump to.
+class FirstAppearance {
+  const FirstAppearance({
+    required this.ok,
+    this.label = '',
+    this.heading = '',
+    this.cfi = '',
+  });
+
+  final bool ok;
+  final String label;
+  final String heading;
+  final String cfi;
+}
+
+String buildFirstAppearanceScript({
+  required String query,
+  required int section,
+}) {
+  final config = jsonEncode({'query': query, 'section': section})
+      .replaceAll('\u2028', r'\u2028')
+      .replaceAll('\u2029', r'\u2029');
+  return 'const cfg = $config;\n$_firstScript';
+}
+
+FirstAppearance parseFirstAppearance(Object? raw) {
+  if (raw is! String || raw.isEmpty) return const FirstAppearance(ok: false);
+  try {
+    final map = jsonDecode(raw);
+    if (map is! Map || map['ok'] != true) {
+      return const FirstAppearance(ok: false);
+    }
+    return FirstAppearance(
+      ok: true,
+      label: '${map['label'] ?? ''}',
+      heading: '${map['heading'] ?? ''}',
+      cfi: '${map['cfi'] ?? ''}',
+    );
+  } catch (e) {
+    return const FirstAppearance(ok: false);
+  }
 }
 
 /// Key of the temporary overlay that colours the translated sentence or
@@ -693,7 +748,17 @@ try {
     const t = await sectionText(i);
     if (t) parts.push({ part: i, text: t });
   }
-  parts.push({ part: idx, text: currentText });
+  // "Whole book" mode reads past the page on screen (spoilers allowed).
+  parts.push({
+    part: idx,
+    text: cfg.whole ? norm(doc.body.textContent) : currentText,
+  });
+  if (cfg.whole) {
+    for (let i = idx + 1; i < sections.length; i++) {
+      const t = await sectionText(i);
+      if (t) parts.push({ part: i, text: t });
+    }
+  }
   out.partsScanned = parts.length;
 
   const W = cfg.window;
@@ -741,6 +806,77 @@ try {
   return JSON.stringify(out);
 } catch (e) {
   return fail('error:' + String(e && e.message ? e.message : e));
+}''';
+
+const String _firstScript = r'''
+try {
+  const view = reader.view;
+  const section = cfg.section;
+  const s = view.book.sections[section];
+  if (!s || typeof s.createDocument !== 'function') {
+    return JSON.stringify({ ok: false, reason: 'no-section' });
+  }
+  const norm = function (t) {
+    return String(t || '').replace(/\s+/g, ' ').trim();
+  };
+  const esc = function (t) {
+    return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  };
+
+  // Chapter title, as the reader's table of contents names it.
+  let label = '';
+  try {
+    const p = view.getProgressOf(section);
+    label = norm(p && p.tocItem && p.tocItem.label);
+  } catch (e) {}
+
+  // Nearest heading before the first mention inside that chapter.
+  let heading = '';
+  const d = await s.createDocument();
+  const rx = new RegExp(
+    '(^|[^\\p{L}\\p{M}\\p{N}_])' + esc(norm(cfg.query)) + '(?![\\p{L}\\p{M}\\p{N}_])',
+    'iu'
+  );
+  const w = d.createTreeWalker(d.body, 5);
+  let node;
+  while ((node = w.nextNode())) {
+    if (node.nodeType === 1) {
+      if (/^H[1-6]$/i.test(node.tagName)) {
+        const t = norm(node.textContent);
+        if (t) heading = t.slice(0, 80);
+      }
+    } else if (rx.test(node.nodeValue)) {
+      break;
+    }
+  }
+
+  // Where to jump: the first hit inside that chapter only.
+  let cfi = '';
+  try {
+    const iter = view.search({
+      query: cfg.query,
+      scope: 'section',
+      matchCase: false,
+      matchDiacritics: false,
+      matchWholeWords: true,
+      index: section,
+    });
+    for await (const r of iter) {
+      if (r && r.subitems && r.subitems.length) {
+        cfi = String(r.subitems[0].cfi);
+        break;
+      }
+    }
+  } catch (e) {}
+  try {
+    view.clearSearch();
+  } catch (e) {}
+  return JSON.stringify({ ok: true, label: label, heading: heading, cfi: cfi });
+} catch (e) {
+  try {
+    reader.view.clearSearch();
+  } catch (x) {}
+  return JSON.stringify({ ok: false, reason: String(e && e.message ? e.message : e) });
 }''';
 
 const String _blocksScript = r'''
