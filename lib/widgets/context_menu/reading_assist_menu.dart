@@ -16,18 +16,19 @@ import 'package:langchain_core/prompts.dart'
     show ChatPromptTemplate, HumanChatMessagePromptTemplate;
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 
-/// A card shown under the selection toolbar with three tabs:
-///  * Translate: a word or short phrase gets a dictionary-style answer (just
-///    the equivalent, chosen for its meaning in the sentence); a sentence or a
-///    paragraph is translated in full, and the part being translated is
-///    coloured in the book while the card is open.
-///  * Explain:   explains the hard passage, knowing the book only up to your page
-///  * Who is it: reminds you who a character is / what a place or term is
+/// The selection assistant. This widget takes no space in the menu: it opens
+/// a white bottom sheet (in its own overlay layer, above the page) and removes
+/// it when the menu closes. The sheet has three tabs:
+///  * Translation: a word or short phrase gets a dictionary-style answer; a
+///    sentence or paragraph is translated in full and coloured in the book
+///    while the sheet is open.
+///  * Who's this?: a notebook-style reminder of a character or place, built
+///    only from what you have read ("No spoilers") or the whole book.
+///  * Explain: explains a hard passage, knowing the book only up to your page.
 ///
-/// The card opens on the most useful tab by itself: a name (character, place,
-/// people) opens "Who is it?", anything else opens "Translate".
-/// The AI tabs are loaded lazily so nothing is sent to an AI provider unless
-/// the tab is shown.
+/// The sheet opens on the most useful tab by itself: a name opens "Who's
+/// this?", anything else opens "Translation". The AI tabs are loaded lazily so
+/// nothing is sent to an AI provider unless the tab is shown.
 class ReadingAssistMenu extends StatefulWidget {
   const ReadingAssistMenu({
     super.key,
@@ -35,6 +36,9 @@ class ReadingAssistMenu extends StatefulWidget {
     required this.decoration,
     required this.axis,
     this.contextText,
+    this.annoCfi = '',
+    this.selectionRect,
+    this.onClose,
   });
 
   final String content;
@@ -42,11 +46,98 @@ class ReadingAssistMenu extends StatefulWidget {
   final Axis axis;
   final String? contextText;
 
+  /// Place of the selection (used by "Save to notes").
+  final String annoCfi;
+
+  /// The selection's rectangle inside the reader, to keep it uncovered.
+  final Rect? selectionRect;
+
+  /// Closes the whole selection menu.
+  final VoidCallback? onClose;
+
   @override
   State<ReadingAssistMenu> createState() => _ReadingAssistMenuState();
 }
 
 class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
+  OverlayEntry? _entry;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.axis == Axis.horizontal) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _open());
+    }
+  }
+
+  void _open() {
+    if (!mounted || _entry != null) return;
+    final overlay = Overlay.maybeOf(context);
+    if (overlay == null) return;
+    _entry = OverlayEntry(
+      builder: (_) => AssistSheet(
+        content: widget.content,
+        contextText: widget.contextText,
+        annoCfi: widget.annoCfi,
+        selectionRect: widget.selectionRect,
+        onDismiss: _close,
+        onJump: widget.onClose,
+      ),
+    );
+    overlay.insert(_entry!);
+  }
+
+  void _close() {
+    final entry = _entry;
+    _entry = null;
+    entry?.remove();
+  }
+
+  @override
+  void dispose() {
+    _close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Vertical writing modes: keep the original translation card.
+    if (widget.axis == Axis.vertical) {
+      return TranslationMenu(
+        content: widget.content,
+        decoration: widget.decoration,
+        axis: widget.axis,
+        contextText: widget.contextText,
+      );
+    }
+    return const SizedBox.shrink();
+  }
+}
+
+/// The bottom sheet itself.
+class AssistSheet extends StatefulWidget {
+  const AssistSheet({
+    super.key,
+    required this.content,
+    required this.onDismiss,
+    this.contextText,
+    this.annoCfi = '',
+    this.selectionRect,
+    this.onJump,
+  });
+
+  final String content;
+  final String? contextText;
+  final String annoCfi;
+  final Rect? selectionRect;
+  final VoidCallback onDismiss;
+  final VoidCallback? onJump;
+
+  @override
+  State<AssistSheet> createState() => _AssistSheetState();
+}
+
+class _AssistSheetState extends State<AssistSheet> {
   late int _tab;
   final Set<int> _opened = <int>{};
 
@@ -73,6 +164,17 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
 
   Future<ReadingAssistContext>? _explainContext;
 
+  /// "Whole book" lets the Who tab use the entire book (spoilers allowed).
+  bool _wholeBook = false;
+  GlobalKey<WhoRecallState> _whoKey = GlobalKey<WhoRecallState>();
+
+  // Sheet size: changed by dragging the handle.
+  double? _height;
+  double _minHeight = 260;
+  double _maxHeight = 600;
+  double _defaultHeight = 380;
+  double _overshoot = 0;
+
   @override
   void initState() {
     super.initState();
@@ -85,25 +187,20 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       );
     }
 
-    _tab = 0;
-    if (widget.axis == Axis.horizontal) {
-      final guess = guessInitialTab(
-        selected: widget.content,
-        contextText: _effectiveContext,
-        answerIsArabic: Prefs().translateTo == LangListEnum.arabic,
-      );
-      _tab = guess.tab;
-      _opened.add(_tab);
-      if (_tab == 0) {
-        _startTranslation();
-      } else {
-        _prepareAiTab(_tab);
-      }
-      if (guess.needsNameCheck) {
-        unawaited(_runNameCheck());
-      }
+    final guess = guessInitialTab(
+      selected: widget.content,
+      contextText: _effectiveContext,
+      answerIsArabic: Prefs().translateTo == LangListEnum.arabic,
+    );
+    _tab = guess.tab;
+    _opened.add(_tab);
+    if (_tab == 0) {
+      _startTranslation();
     } else {
-      _opened.add(0);
+      _prepareAiTab(_tab);
+    }
+    if (guess.needsNameCheck) {
+      unawaited(_runNameCheck());
     }
   }
 
@@ -121,8 +218,9 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
       (widget.contextText?.trim().isEmpty ?? true) ? null : widget.contextText;
 
   bool get _arabic =>
-      Localizations.localeOf(context).languageCode == 'ar' ||
-      Prefs().translateTo == LangListEnum.arabic;
+      !kAssistEnglishLabels &&
+      (Localizations.localeOf(context).languageCode == 'ar' ||
+          Prefs().translateTo == LangListEnum.arabic);
 
   String _t(String ar, String en) => _arabic ? ar : en;
 
@@ -302,6 +400,7 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     _userInteracted = true;
     setState(() {
       _version++;
+      _whoKey = GlobalKey<WhoRecallState>();
       _tab = 0;
       _opened
         ..clear()
@@ -359,12 +458,12 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _languageRow(ColorScheme scheme) {
+  Widget _languageRow(AssistPalette p) {
     return DefaultTextStyle.merge(
-      style: TextStyle(fontSize: 12.5, color: scheme.onSurfaceVariant),
+      style: TextStyle(fontSize: 13, color: p.muted),
       child: Row(
         children: [
-          Icon(Icons.translate, size: 14, color: scheme.onSurfaceVariant),
+          Icon(Icons.translate, size: 15, color: p.muted),
           const SizedBox(width: 8),
           _langPicker(true),
           Padding(
@@ -374,7 +473,7 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
                   ? Icons.arrow_back_ios
                   : Icons.arrow_forward_ios,
               size: 12,
-              color: scheme.onSurfaceVariant,
+              color: p.muted,
             ),
           ),
           _langPicker(false),
@@ -383,88 +482,90 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _scopeChip(ColorScheme scheme, int index, String label) {
+  Widget _scopeChip(AssistPalette p, int index, String label) {
     final selected = _scope == index;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () => _setScope(index),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
         decoration: BoxDecoration(
-          color: selected ? scheme.secondaryContainer : Colors.transparent,
+          color: selected ? p.track : Colors.transparent,
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: selected ? Colors.transparent : scheme.outlineVariant,
+            color: selected ? Colors.transparent : p.track,
+            width: 1.5,
           ),
         ),
         child: Text(
           label,
           style: TextStyle(
-            fontSize: 12,
+            fontSize: 13,
             fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-            color: selected
-                ? scheme.onSecondaryContainer
-                : scheme.onSurfaceVariant,
+            color: selected ? p.text : p.muted,
           ),
         ),
       ),
     );
   }
 
-  Widget _scopeChips(ColorScheme scheme) {
+  Widget _scopeChips(AssistPalette p) {
     return Wrap(
       spacing: 8,
       runSpacing: 6,
       children: [
-        _scopeChip(scheme, 0, _t('المحدد', 'Selection')),
-        _scopeChip(scheme, 1, _t('الجملة', 'Sentence')),
-        _scopeChip(scheme, 2, _t('الفقرة', 'Paragraph')),
+        _scopeChip(p, 0, _t('المحدد', 'Selection')),
+        _scopeChip(p, 1, _t('الجملة', 'Sentence')),
+        _scopeChip(p, 2, _t('الفقرة', 'Paragraph')),
       ],
     );
   }
 
-  Widget _translateBody(ColorScheme scheme) {
+  Widget _translateBody(AssistPalette p) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        _scopeChips(scheme),
-        const SizedBox(height: 12),
-        KeyedSubtree(
-          key: ValueKey('translation-$_translationVersion'),
-          child:
-              _translationWidget ??
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 6),
-                child: SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+        _scopeChips(p),
+        const SizedBox(height: 14),
+        DefaultTextStyle.merge(
+          style: TextStyle(fontSize: 16, height: 1.65, color: p.text),
+          child: KeyedSubtree(
+            key: ValueKey('translation-$_translationVersion'),
+            child:
+                _translationWidget ??
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 6),
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
                 ),
-              ),
+          ),
         ),
       ],
     );
   }
 
   // ---------------------------------------------------------------------------
-  // AI tabs (Explain / Who is it)
+  // Explain
   // ---------------------------------------------------------------------------
 
   void _prepareAiTab(int index) {
-    // "Who is it?" (tab 2) gathers its own text and keeps its own notebook.
+    // "Who's this?" (tab 2) gathers its own text and keeps its own notebook.
     if (index == 1) {
       _explainContext ??= _loadContext(scan: false);
     }
   }
 
-  Widget _hint(ColorScheme scheme, String text) {
+  Widget _hint(AssistPalette p, String text) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Text(
         text,
-        style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+        style: TextStyle(fontSize: 14, height: 1.5, color: p.muted),
       ),
     );
   }
@@ -480,35 +581,13 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     );
   }
 
-  Widget _caption(ColorScheme scheme) {
-    final color = scheme.onSurfaceVariant.withValues(alpha: 0.8);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Row(
-        children: [
-          Icon(Icons.lock_outline, size: 12, color: color),
-          const SizedBox(width: 4),
-          Flexible(
-            child: Text(
-              _t(
-                'يعتمد على ما قرأتَه فقط، بلا حرق للأحداث',
-                'Uses only what you have read — no spoilers',
-              ),
-              style: TextStyle(fontSize: 11, color: color),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _aiBody(ColorScheme scheme) {
+  Widget _aiBody(AssistPalette p) {
     return FutureBuilder<ReadingAssistContext>(
       future: _explainContext,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
           return _hint(
-            scheme,
+            p,
             _t(
               'أقرأ ما وصلتَ إليه من الكتاب…',
               'Reading what you have read so far…',
@@ -517,36 +596,28 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         }
         final ctx = snapshot.data;
         if (ctx == null || !ctx.ok) {
-          return _hint(scheme, _failureMessage(ctx?.reason ?? 'unknown'));
+          return _hint(p, _failureMessage(ctx?.reason ?? 'unknown'));
         }
-        final language = _targetLanguageName();
         final prompt = buildExplainPrompt(
-          language: language,
+          language: _targetLanguageName(),
           selected: widget.content,
           contextSentence: _effectiveContext,
           recent: ctx.recent,
         );
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _caption(scheme),
-            DefaultTextStyle.merge(
-              style: const TextStyle(fontSize: 15, height: 1.55),
-              child: AiStream(
-                key: ValueKey('explain-$_version'),
-                prompt: _payload(prompt),
-                regenerate: true,
-              ),
-            ),
-          ],
+        return DefaultTextStyle.merge(
+          style: TextStyle(fontSize: 16, height: 1.7, color: p.text),
+          child: AiStream(
+            key: ValueKey('explain-$_version'),
+            prompt: _payload(prompt),
+            regenerate: true,
+          ),
         );
       },
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Tabs
+  // Tabs and the sheet itself
   // ---------------------------------------------------------------------------
 
   void _select(int index, {bool manual = true}) {
@@ -565,11 +636,42 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
     setState(() {});
   }
 
-  Widget _tabPill(ColorScheme scheme, int index, IconData icon, String label) {
+  Widget _handle(AssistPalette p) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: (d) {
+        final next = (_height ?? _defaultHeight) - d.delta.dy;
+        if (next < _minHeight && d.delta.dy > 0) {
+          _overshoot += d.delta.dy;
+        } else {
+          _overshoot = 0;
+        }
+        setState(() => _height = next.clamp(_minHeight, _maxHeight).toDouble());
+      },
+      onVerticalDragEnd: (_) {
+        // Pulled down past the smallest size: close the sheet.
+        if (_overshoot > 70) widget.onDismiss();
+        _overshoot = 0;
+      },
+      child: SizedBox(
+        height: 26,
+        width: double.infinity,
+        child: Center(
+          child: Container(
+            width: 44,
+            height: 5,
+            decoration: BoxDecoration(
+              color: p.muted.withValues(alpha: 0.35),
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _tabPill(AssistPalette p, int index, String label) {
     final selected = _tab == index;
-    final color = selected
-        ? scheme.onPrimaryContainer
-        : scheme.onSurfaceVariant;
     return Expanded(
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
@@ -577,155 +679,248 @@ class _ReadingAssistMenuState extends State<ReadingAssistMenu> {
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
-          padding: const EdgeInsets.symmetric(vertical: 8),
+          padding: const EdgeInsets.symmetric(vertical: 11),
+          alignment: Alignment.center,
           decoration: BoxDecoration(
-            color: selected ? scheme.primaryContainer : Colors.transparent,
-            borderRadius: BorderRadius.circular(11),
+            color: selected ? p.raised : Colors.transparent,
+            borderRadius: BorderRadius.circular(15),
+            boxShadow: selected
+                ? [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.10),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ]
+                : null,
           ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 16, color: color),
-              const SizedBox(width: 5),
-              Flexible(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                    color: color,
-                  ),
-                ),
-              ),
-            ],
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 15.5,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              color: selected ? p.text : p.muted,
+            ),
           ),
         ),
       ),
     );
   }
 
-  Widget _tabBar(ColorScheme scheme) {
+  /// Order as in the design: Translation, Who's this?, Explain.
+  Widget _tabBar(AssistPalette p) {
     return Container(
-      padding: const EdgeInsets.all(3),
+      padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.7),
-        borderRadius: BorderRadius.circular(14),
+        color: p.track,
+        borderRadius: BorderRadius.circular(19),
       ),
       child: Row(
         children: [
-          _tabPill(scheme, 0, Icons.translate, _t('ترجمة', 'Translate')),
-          _tabPill(scheme, 1, Icons.lightbulb_outline, _t('شرح', 'Explain')),
-          _tabPill(
-            scheme,
-            2,
-            Icons.person_search_outlined,
-            _t('من هذا؟', 'Who is it?'),
-          ),
+          _tabPill(p, 0, _t('ترجمة', 'Translation')),
+          _tabPill(p, 2, _t('من هذا؟', "Who's this?")),
+          _tabPill(p, 1, _t('شرح', 'Explain')),
         ],
       ),
     );
   }
 
-  Widget _bodyFor(ColorScheme scheme, int index) {
-    if (!_opened.contains(index)) return const SizedBox.shrink();
-    if (index == 0) return _translateBody(scheme);
-    if (index == 2) {
-      return DefaultTextStyle.merge(
-        style: const TextStyle(fontSize: 15, height: 1.55),
-        child: WhoRecall(
-          key: ValueKey('who-$_version'),
-          selected: widget.content,
-          languageName: _targetLanguageName(),
-          languageCode: _targetLanguageCode(),
-          arabic: _arabic,
+  Widget _modePill(AssistPalette p, bool whole, String label) {
+    final selected = _wholeBook == whole;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        if (selected) return;
+        setState(() {
+          _wholeBook = whole;
+          // A new lookup in the other mode.
+          _whoKey = GlobalKey<WhoRecallState>();
+        });
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? p.raised : Colors.transparent,
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: selected
+              ? [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.09),
+                    blurRadius: 6,
+                    offset: const Offset(0, 2),
+                  ),
+                ]
+              : null,
         ),
-      );
-    }
-    return _aiBody(scheme);
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            color: selected ? p.text : p.muted,
+          ),
+        ),
+      ),
+    );
   }
 
-  BoxDecoration _cardDecoration(ColorScheme scheme) {
-    // Keep the original look in e-ink mode (plain, high contrast).
-    if (Prefs().eInkMode) return widget.decoration;
-    return BoxDecoration(
-      color: scheme.surfaceContainerHigh,
-      borderRadius: BorderRadius.circular(22),
-      border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
-      boxShadow: [
-        BoxShadow(
-          color: Colors.black.withValues(alpha: 0.18),
-          blurRadius: 20,
-          offset: const Offset(0, 6),
+  /// "No spoilers | Whole book" and the flag (redo from scratch).
+  Widget _contextBar(AssistPalette p) {
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(
+            color: p.track,
+            borderRadius: BorderRadius.circular(17),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _modePill(p, false, _t('بلا حرق', 'No spoilers')),
+              _modePill(p, true, _t('الكتاب كله', 'Whole book')),
+            ],
+          ),
+        ),
+        const Spacer(),
+        IconButton(
+          tooltip: _t('إعادة الإجابة من الصفر', 'Redo from scratch'),
+          visualDensity: VisualDensity.compact,
+          icon: Icon(Icons.outlined_flag, color: p.muted),
+          onPressed: () => _whoKey.currentState?.redo(),
         ),
       ],
     );
   }
 
+  Widget _whoBody(AssistPalette p) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _contextBar(p),
+        const SizedBox(height: 10),
+        WhoRecall(
+          key: _whoKey,
+          selected: widget.content,
+          languageName: _targetLanguageName(),
+          languageCode: _targetLanguageCode(),
+          arabic: _arabic,
+          wholeBook: _wholeBook,
+          annoCfi: widget.annoCfi,
+          onJump: widget.onJump,
+        ),
+      ],
+    );
+  }
+
+  Widget _bodyFor(AssistPalette p, int index) {
+    if (!_opened.contains(index)) return const SizedBox.shrink();
+    if (index == 0) return _translateBody(p);
+    if (index == 2) return _whoBody(p);
+    return _aiBody(p);
+  }
+
+  /// True when the sheet at the bottom would hide the selection. The
+  /// rectangle is already in screen coordinates.
+  bool _coversSelection(double screenHeight, double height, double margin) {
+    final rect = widget.selectionRect;
+    if (rect == null) return false;
+    final sheetTop = screenHeight - margin - height;
+    return rect.bottom > sheetTop - 8;
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Vertical writing modes: keep the original translation card.
-    if (widget.axis == Axis.vertical) {
-      return TranslationMenu(
-        content: widget.content,
-        decoration: widget.decoration,
-        axis: widget.axis,
-        contextText: widget.contextText,
-      );
+    final p = AssistPalette.of(context);
+    final media = MediaQuery.of(context);
+    final screenHeight = media.size.height;
+    final bottomMargin = media.padding.bottom + 46;
+
+    _minHeight = 260;
+    _maxHeight = (screenHeight * 0.82).clamp(300.0, 900.0).toDouble();
+    _defaultHeight = (screenHeight * 0.48)
+        .clamp(_minHeight, _maxHeight)
+        .toDouble();
+    final height = (_height ?? _defaultHeight)
+        .clamp(_minHeight, _maxHeight)
+        .toDouble();
+
+    // Bottom by default; at the top when the bottom would cover the selection
+    // and the top does not.
+    var atTop = false;
+    if (_coversSelection(screenHeight, height, bottomMargin)) {
+      final rect = widget.selectionRect;
+      final topEdge = media.padding.top + 8 + height;
+      if (rect != null && rect.top > topEdge + 8) atTop = true;
     }
 
-    final scheme = Theme.of(context).colorScheme;
-    final screenHeight = MediaQuery.of(context).size.height;
-    final cardHeight = (screenHeight * 0.44).clamp(220.0, 360.0).toDouble();
-
-    return Expanded(
-      child: AnimatedSize(
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
-        child: Material(
-          type: MaterialType.transparency,
-          // Everything in the card follows the answer language: with Arabic the
-          // tabs, chips and text run from right to left.
-          child: Directionality(
-            textDirection: _answerDirection,
-            child: Container(
-              height: cardHeight,
-              width: double.infinity,
-              decoration: _cardDecoration(scheme),
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-              child: DefaultTextStyle.merge(
-                style: TextStyle(color: scheme.onSurface),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _tabBar(scheme),
-                    const SizedBox(height: 10),
-                    Expanded(
-                      child: IndexedStack(
-                        index: _tab,
-                        sizing: StackFit.expand,
-                        children: [
-                          for (var i = 0; i < 3; i++)
-                            SingleChildScrollView(child: _bodyFor(scheme, i)),
-                        ],
-                      ),
-                    ),
-                    if (_tab == 0) ...[
-                      Divider(
-                        height: 1,
-                        color: scheme.outlineVariant.withValues(alpha: 0.7),
-                      ),
-                      const SizedBox(height: 8),
-                      _languageRow(scheme),
-                    ],
-                  ],
-                ),
+    final sheet = Directionality(
+      textDirection: _answerDirection,
+      child: Material(
+        type: MaterialType.transparency,
+        child: Container(
+          height: height,
+          decoration: BoxDecoration(
+            color: p.sheet,
+            borderRadius: BorderRadius.circular(30),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.18),
+                blurRadius: 28,
+                offset: const Offset(0, 8),
               ),
+            ],
+          ),
+          child: DefaultTextStyle.merge(
+            style: TextStyle(color: p.text),
+            child: Column(
+              children: [
+                _handle(p),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: _tabBar(p),
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: IndexedStack(
+                    index: _tab,
+                    sizing: StackFit.expand,
+                    children: [
+                      for (var i = 0; i < 3; i++)
+                        SingleChildScrollView(
+                          padding: const EdgeInsets.fromLTRB(20, 2, 20, 20),
+                          child: _bodyFor(p, i),
+                        ),
+                    ],
+                  ),
+                ),
+                if (_tab == 0) ...[
+                  Divider(height: 1, color: p.track),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 10, 20, 12),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: _languageRow(p),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
         ),
       ),
+    );
+
+    return Positioned(
+      left: 12,
+      right: 12,
+      top: atTop ? media.padding.top + 8 : null,
+      bottom: atTop ? null : bottomMargin,
+      child: PointerInterceptor(child: sheet),
     );
   }
 }
