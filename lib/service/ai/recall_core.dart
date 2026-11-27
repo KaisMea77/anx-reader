@@ -144,12 +144,58 @@ class RecallSnapshot {
   }
 }
 
+/// Where a name first appears in the book.
+class FirstSeen {
+  const FirstSeen({
+    required this.section,
+    required this.offset,
+    this.label = '',
+    this.heading = '',
+    this.cfi = '',
+  });
+
+  final int section;
+  final int offset;
+
+  /// Chapter title, nearest sub-heading before it, and a place to jump to.
+  final String label;
+  final String heading;
+  final String cfi;
+
+  TextPosition get pos => TextPosition(section, offset);
+
+  Map<String, Object?> toJson() => {
+    's': section,
+    'o': offset,
+    'l': label,
+    'h': heading,
+    'c': cfi,
+  };
+
+  static FirstSeen? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final s = json['s'];
+    final o = json['o'];
+    if (s is! num || o is! num) return null;
+    return FirstSeen(
+      section: s.toInt(),
+      offset: o.toInt(),
+      label: json['l'] is String ? json['l'] as String : '',
+      heading: json['h'] is String ? json['h'] as String : '',
+      cfi: json['c'] is String ? json['c'] as String : '',
+    );
+  }
+}
+
 class RecallEntity {
   RecallEntity({required this.key, required this.display});
 
   final String key;
   String display;
   final List<RecallSnapshot> snapshots = [];
+
+  /// Where the name first appears (null when not known yet).
+  FirstSeen? first;
 
   /// The newest snapshot that does not go beyond [current]. Snapshots that
   /// cover text the reader has not reached are never returned.
@@ -172,7 +218,7 @@ class RecallEntity {
     return latest;
   }
 
-  void putSnapshot(RecallSnapshot snapshot, {int max = 4}) {
+  void putSnapshot(RecallSnapshot snapshot, {int max = 5}) {
     snapshots.removeWhere((s) => s.pos == snapshot.pos);
     snapshots.add(snapshot);
     snapshots.sort((a, b) => a.pos.compareTo(b.pos));
@@ -214,6 +260,7 @@ class RecallBook {
     'entities': entities.map(
       (k, e) => MapEntry(k, {
         'd': e.display,
+        'first': e.first?.toJson(),
         'snaps': e.snapshots.map((s) => s.toJson()).toList(),
       }),
     ),
@@ -230,6 +277,7 @@ class RecallBook {
         key: k,
         display: v['d'] is String ? v['d'] as String : k,
       );
+      entity.first = FirstSeen.fromJson(v['first']);
       final snaps = v['snaps'];
       if (snaps is List) {
         for (final s in snaps) {
@@ -511,22 +559,34 @@ List<RecallFact> mergeFacts(
 // -----------------------------------------------------------------------------
 
 /// Turns verified facts into one fluent paragraph in [language].
+/// With [wholeBook] the facts may reach past the reader's page, and the
+/// paragraph covers the whole story of the name.
 String buildComposePrompt({
   required String term,
   required String language,
   required List<RecallFact> facts,
+  bool wholeBook = false,
 }) {
   final b = StringBuffer();
   b.writeln(
     'Write a short reminder about "$term" for a reader who has '
     'forgotten who or what it is.',
   );
-  b.writeln(
-    'Use ONLY the numbered facts below. They come from the book up to '
-    "the reader's current page and are in reading order. Do not add "
-    'anything else, do not use outside knowledge, and do not mention these '
-    'instructions.',
-  );
+  if (wholeBook) {
+    b.writeln(
+      'Use ONLY the numbered facts below. They come from the WHOLE book '
+      '(including events the reader may not have reached yet) and are in '
+      'reading order. Spoilers are allowed. Do not add anything else, do '
+      'not use outside knowledge, and do not mention these instructions.',
+    );
+  } else {
+    b.writeln(
+      'Use ONLY the numbered facts below. They come from the book up to '
+      "the reader's current page and are in reading order. Do not add "
+      'anything else, do not use outside knowledge, and do not mention these '
+      'instructions.',
+    );
+  }
   b.writeln('\nStyle:');
   b.writeln(
     '- Write in $language: natural, fluent and well-formed, the way a '
@@ -536,10 +596,60 @@ String buildComposePrompt({
     '- ONE paragraph of 3 to 5 sentences. No headings, no bullet '
     'points, no labels, no bold text.',
   );
+  if (wholeBook) {
+    b.writeln(
+      '- Begin with who or what "$term" is, then the key events in '
+      'order, and finish with how the story leaves it.',
+    );
+  } else {
+    b.writeln(
+      '- Begin with who or what "$term" is, then the key events in '
+      "order, and finish with the latest situation at the reader's current "
+      'position.',
+    );
+  }
   b.writeln(
-    '- Begin with who or what "$term" is, then the key events in '
-    "order, and finish with the latest situation at the reader's current "
-    'position.',
+    '- Write names in $language spelling and give the original '
+    'spelling in parentheses only the first time each name appears.',
+  );
+  b.writeln('- If a detail is not in the facts, leave it out. Do not guess.');
+  b.writeln('\nFacts:');
+  for (var i = 0; i < facts.length; i++) {
+    b.writeln('${i + 1}. ${facts[i].fact}');
+  }
+  return b.toString();
+}
+
+/// A fuller profile from the same verified facts (2-3 short paragraphs).
+String buildDetailedPrompt({
+  required String term,
+  required String language,
+  required List<RecallFact> facts,
+  bool wholeBook = false,
+}) {
+  final b = StringBuffer();
+  b.writeln('Write a detailed profile of "$term" for a reader.');
+  b.writeln(
+    wholeBook
+        ? 'Use ONLY the numbered facts below. They come from the WHOLE book and '
+              'are in reading order. Spoilers are allowed. Do not add anything '
+              'else and do not use outside knowledge.'
+        : 'Use ONLY the numbered facts below. They come from the book up to the '
+              "reader's current page and are in reading order. Do not add anything "
+              'else and do not use outside knowledge.',
+  );
+  b.writeln('\nStyle:');
+  b.writeln(
+    '- Write in $language: natural, fluent, well-formed. Never '
+    'translate word by word.',
+  );
+  b.writeln(
+    '- 2 to 3 short paragraphs, about 120 to 180 words in total. No '
+    'headings, no bullet points, no bold text.',
+  );
+  b.writeln(
+    '- First paragraph: who or what "$term" is. Second: relationships '
+    'and the key events in order. Third: ${wholeBook ? 'how the story leaves it' : "the latest situation at the reader's current position"}.',
   );
   b.writeln(
     '- Write names in $language spelling and give the original '
@@ -557,6 +667,11 @@ String buildComposePrompt({
 // The engine: one complete lookup, with the book and the AI passed in as
 // functions so the whole flow can be tested without a phone.
 // -----------------------------------------------------------------------------
+
+/// Section number used for notes written in "Whole book" mode. It lies after
+/// everything in the book, so such notes are never used when reading without
+/// spoilers, while whole-book lookups can still build on any earlier note.
+const int wholeBookSection = 1 << 30;
 
 /// What the card should say while waiting.
 enum RecallStatus { looking, gathering, extracting, writing }
@@ -579,13 +694,17 @@ class RecallEvent {
       text = null,
       fromMemory = false,
       done = false,
-      detail = '';
+      detail = '',
+      first = null,
+      factList = const [];
 
   const RecallEvent.text(
     String this.text, {
     this.facts = 0,
     this.fromMemory = false,
     this.done = false,
+    this.first,
+    this.factList = const [],
   }) : status = null,
        problem = null,
        detail = '';
@@ -595,7 +714,9 @@ class RecallEvent {
       text = null,
       facts = 0,
       fromMemory = false,
-      done = false;
+      done = false,
+      first = null,
+      factList = const [];
 
   final RecallStatus? status;
   final RecallProblem? problem;
@@ -608,6 +729,12 @@ class RecallEvent {
   /// True on the last event of a successful lookup.
   final bool done;
   final String detail;
+
+  /// Where the name first appears, only when the reader may be told.
+  final FirstSeen? first;
+
+  /// The verified facts behind the paragraph (on the last event).
+  final List<RecallFact> factList;
 }
 
 /// The outside world the engine needs.
@@ -618,11 +745,14 @@ class RecallIO {
     required this.write,
     required this.load,
     required this.save,
+    this.locateFirst,
   });
 
-  /// Reads the book text up to the end of the page on screen.
+  /// Reads the book text up to the end of the page on screen (or, with
+  /// [whole], the whole book).
   final Future<ReadingAssistContext> Function({
     required bool scan,
+    required bool whole,
     required int first,
     required int last,
     int? sinceSection,
@@ -638,10 +768,20 @@ class RecallIO {
 
   final Future<RecallBook> Function() load;
   final Future<void> Function(RecallBook book) save;
+
+  /// Finds the chapter title, nearest sub-heading and jump place of the first
+  /// mention (optional).
+  final Future<FirstAppearance> Function({
+    required String term,
+    required int section,
+  })?
+  locateFirst;
 }
 
 /// One lookup of [term]: finds what is already known, reads only what is new,
 /// asks the AI for proven facts, writes the paragraph and remembers it.
+/// With [whole] the whole book may be used (spoilers allowed); those notes are
+/// filed after the end of the book so they never reach a no-spoiler lookup.
 Stream<RecallEvent> recall({
   required String term,
   required String languageCode,
@@ -649,6 +789,7 @@ Stream<RecallEvent> recall({
   required bool fresh,
   required RecallIO io,
   required int nowMs,
+  bool whole = false,
 }) async* {
   try {
     final key = entityKey(term);
@@ -661,28 +802,42 @@ Stream<RecallEvent> recall({
     final entity = store.entities[key];
 
     yield const RecallEvent.status(RecallStatus.looking);
-    final probe = await io.readBook(scan: false, first: 3, last: 5);
+    final probe = await io.readBook(
+      scan: false,
+      whole: false,
+      first: 3,
+      last: 5,
+    );
     if (!probe.ok) {
       yield RecallEvent.problem(RecallProblem.noPosition, detail: probe.reason);
       return;
     }
-    final now = TextPosition(probe.positionSection, probe.positionOffset);
+    final reader = TextPosition(probe.positionSection, probe.positionOffset);
+    final now = whole ? const TextPosition(wholeBookSection, 0) : reader;
     final base = entity?.baseFor(now);
+
+    var first = entity?.first;
+    // Never tell the reader about a place they have not reached yet.
+    FirstSeen? shownFirst() {
+      final f = first;
+      if (f == null) return null;
+      return (whole || f.pos.compareTo(reader) <= 0) ? f : null;
+    }
 
     Future<void> remember(
       List<RecallFact> facts,
       Map<String, String> summaries,
     ) async {
-      store
-          .entity(key, term)
-          .putSnapshot(
-            RecallSnapshot(
-              pos: now,
-              facts: facts,
-              summaries: summaries,
-              updatedMs: nowMs,
-            ),
-          );
+      final e = store.entity(key, term);
+      if (first != null) e.first = first;
+      e.putSnapshot(
+        RecallSnapshot(
+          pos: now,
+          facts: facts,
+          summaries: summaries,
+          updatedMs: nowMs,
+        ),
+      );
       await io.save(store);
     }
 
@@ -700,6 +855,7 @@ Stream<RecallEvent> recall({
       yield const RecallEvent.status(RecallStatus.gathering);
       scanned = await io.readBook(
         scan: true,
+        whole: whole,
         first: base == null ? 4 : 2,
         last: 8,
         sinceSection: base?.pos.section,
@@ -726,6 +882,8 @@ Stream<RecallEvent> recall({
         facts: base.facts.length,
         fromMemory: true,
         done: true,
+        first: shownFirst(),
+        factList: base.facts,
       );
       return;
     }
@@ -735,6 +893,8 @@ Stream<RecallEvent> recall({
         facts: base.facts.length,
         fromMemory: true,
         done: true,
+        first: shownFirst(),
+        factList: base.facts,
       );
       await remember(base.facts, base.summaries);
       return;
@@ -743,11 +903,34 @@ Stream<RecallEvent> recall({
     var facts = base?.facts ?? const <RecallFact>[];
     if (step == RecallStep.extract) {
       final ctx = scanned!;
-      // The scan covers everything up to the end of the page on screen, so no
-      // passage at all means the name has not appeared yet: nothing to ask.
+      // The scan covers everything the mode allows, so no passage at all
+      // means the name has not appeared: nothing to ask.
       if (ctx.snippets.isEmpty) {
         yield const RecallEvent.problem(RecallProblem.notMentioned);
         return;
+      }
+      // A search from the very start finds the first mention: remember where.
+      if (base == null && first == null) {
+        final earliest = ctx.snippets.first;
+        var seen = FirstSeen(section: earliest.part, offset: earliest.pos);
+        final locate = io.locateFirst;
+        if (locate != null) {
+          try {
+            final info = await locate(term: term, section: earliest.part);
+            if (info.ok) {
+              seen = FirstSeen(
+                section: earliest.part,
+                offset: earliest.pos,
+                label: info.label,
+                heading: info.heading,
+                cfi: info.cfi,
+              );
+            }
+          } catch (e) {
+            // The card is optional: keep going without it.
+          }
+        }
+        first = seen;
       }
       yield const RecallEvent.status(RecallStatus.extracting);
       final passages = [for (final s in ctx.snippets) s.text];
@@ -761,7 +944,7 @@ Stream<RecallEvent> recall({
         raw,
         sourceText: joinedSource(passages, ctx.recent),
         passagePositions: positions,
-        fallback: now,
+        fallback: reader,
       );
       if (!parsed.jsonOk) {
         yield RecallEvent.problem(
@@ -787,6 +970,8 @@ Stream<RecallEvent> recall({
           facts: base.facts.length,
           fromMemory: true,
           done: true,
+          first: shownFirst(),
+          factList: base.facts,
         );
         await remember(base.facts, base.summaries);
         return;
@@ -797,7 +982,12 @@ Stream<RecallEvent> recall({
     yield RecallEvent.status(RecallStatus.writing, facts: facts.length);
     var text = '';
     await for (final chunk in io.write(
-      buildComposePrompt(term: term, language: languageName, facts: facts),
+      buildComposePrompt(
+        term: term,
+        language: languageName,
+        facts: facts,
+        wholeBook: whole,
+      ),
     )) {
       text = chunk;
       if (text.trim().isNotEmpty) {
@@ -818,7 +1008,13 @@ Stream<RecallEvent> recall({
         newText: text,
       ),
     );
-    yield RecallEvent.text(text, facts: facts.length, done: true);
+    yield RecallEvent.text(
+      text,
+      facts: facts.length,
+      done: true,
+      first: shownFirst(),
+      factList: facts,
+    );
   } catch (e) {
     yield RecallEvent.problem(RecallProblem.unexpected, detail: '$e');
   }
