@@ -824,39 +824,37 @@ class _AssistSheetState extends State<AssistSheet> {
     return _aiBody(p);
   }
 
-  /// True when the sheet at the bottom would hide the selection. The
-  /// rectangle is already in screen coordinates.
-  bool _coversSelection(double screenHeight, double height, double margin) {
-    final rect = widget.selectionRect;
-    if (rect == null) return false;
-    final sheetTop = screenHeight - margin - height;
-    return rect.bottom > sheetTop - 8;
-  }
-
   @override
   Widget build(BuildContext context) {
     final p = AssistPalette.of(context);
     final media = MediaQuery.of(context);
     final screenHeight = media.size.height;
     final bottomMargin = media.padding.bottom + 46;
+    final topInset = media.padding.top + 8;
 
-    _minHeight = 260;
-    _maxHeight = (screenHeight * 0.82).clamp(300.0, 900.0).toDouble();
-    _defaultHeight = (screenHeight * 0.48)
+    // Smaller than before (about a third of the screen); the handle resizes it.
+    _minHeight = 190;
+    _maxHeight = (screenHeight * 0.7).clamp(300.0, 800.0).toDouble();
+    _defaultHeight = (screenHeight * 0.34).clamp(230.0, 420.0).toDouble();
+    final preferred = (_height ?? _defaultHeight)
         .clamp(_minHeight, _maxHeight)
         .toDouble();
-    final height = (_height ?? _defaultHeight)
-        .clamp(_minHeight, _maxHeight)
-        .toDouble();
 
-    // Bottom by default; at the top when the bottom would cover the selection
-    // and the top does not.
-    var atTop = false;
-    if (_coversSelection(screenHeight, height, bottomMargin)) {
-      final rect = widget.selectionRect;
-      final topEdge = media.padding.top + 8 + height;
-      if (rect != null && rect.top > topEdge + 8) atTop = true;
-    }
+    // Above or below the selection, whichever side has more room, and small
+    // enough to fit there, so it never covers the word being translated nor
+    // the toolbar next to it.
+    final rect = widget.selectionRect;
+    final plan = planSheet(
+      screenHeight: screenHeight,
+      topInset: topInset,
+      bottomMargin: bottomMargin,
+      preferredHeight: preferred,
+      minHeight: _minHeight,
+      selectionTop: rect?.top,
+      selectionBottom: rect?.bottom,
+    );
+    final height = plan.height;
+    final atTop = plan.atTop;
 
     final sheet = Directionality(
       textDirection: _answerDirection,
@@ -898,7 +896,8 @@ class _AssistSheetState extends State<AssistSheet> {
                     ],
                   ),
                 ),
-                if (_tab == 0) ...[
+                // The language row needs room: hidden when the sheet is very small.
+                if (_tab == 0 && height >= 250) ...[
                   Divider(height: 1, color: p.track),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(20, 10, 20, 12),
@@ -918,7 +917,7 @@ class _AssistSheetState extends State<AssistSheet> {
     return Positioned(
       left: 12,
       right: 12,
-      top: atTop ? media.padding.top + 8 : null,
+      top: atTop ? topInset : null,
       bottom: atTop ? null : bottomMargin,
       child: PointerInterceptor(child: sheet),
     );
