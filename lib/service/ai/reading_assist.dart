@@ -201,6 +201,58 @@ class ReadingAssistBlocks {
   final String reason;
 }
 
+/// Where the bottom sheet goes and how tall it is.
+class SheetPlan {
+  const SheetPlan({required this.atTop, required this.height});
+
+  /// True: pinned to the top of the screen; false: to the bottom.
+  final bool atTop;
+  final double height;
+}
+
+/// Places the sheet so that it never covers the selection or the toolbar that
+/// sits next to it. The free space above and below the selection is measured
+/// (keeping room for the toolbar), the roomier side is used, and the sheet is
+/// made smaller when it would not fit.
+///
+/// All numbers are screen coordinates in logical pixels. Without a selection
+/// the sheet simply goes to the bottom.
+SheetPlan planSheet({
+  required double screenHeight,
+  required double topInset,
+  required double bottomMargin,
+  required double preferredHeight,
+  required double minHeight,
+  double? selectionTop,
+  double? selectionBottom,
+
+  /// Room kept for the toolbar next to the selection.
+  double toolbarSpace = 112,
+  double gap = 14,
+
+  /// The sheet is never made smaller than this, even if it must overlap.
+  double floor = 170,
+}) {
+  final usable = screenHeight - topInset - bottomMargin;
+  if (selectionTop == null || selectionBottom == null) {
+    final h = preferredHeight < minHeight
+        ? minHeight
+        : (preferredHeight > usable ? usable : preferredHeight);
+    return SheetPlan(atTop: false, height: h);
+  }
+  // The toolbar goes above the selection when there is room, else below it.
+  final toolbarAbove = selectionTop - topInset >= toolbarSpace + 8;
+  final belowStart = selectionBottom + (toolbarAbove ? gap : toolbarSpace + 8);
+  final aboveEnd = selectionTop - (toolbarAbove ? toolbarSpace + 8 : gap);
+  final below = screenHeight - bottomMargin - belowStart;
+  final above = aboveEnd - topInset;
+  final atTop = above > below;
+  final room = atTop ? above : below;
+  final available = room < floor ? floor : room;
+  final h = preferredHeight < available ? preferredHeight : available;
+  return SheetPlan(atTop: atTop, height: h);
+}
+
 /// Set to true to show the card's own labels in English even when the answer
 /// language is Arabic.
 const bool kAssistEnglishLabels = false;
